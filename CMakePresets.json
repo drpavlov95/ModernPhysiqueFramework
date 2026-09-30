@@ -1,0 +1,89 @@
+{
+    "version": 2,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_CXX_FLAGS": "$env{COMMONLIBSSE_COMPILER} $env{COMMONLIBSSE_PLATFORM} $env{COMMONLIBSSE_TEXT}"
+            }
+        },
+        {
+            "name": "vcpkg",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": "E:/SkyrimDev/vcpkg/scripts/buildsystems/vcpkg.cmake",
+                "VCPKG_TARGET_TRIPLET": "x64-windows-skse",
+                "VCPKG_HOST_TRIPLET": "x64-windows-skse",
+                "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+            }
+        },
+        {
+            "name": "win32-unicode",
+            "hidden": true,
+            "environment": {
+                "COMMONLIBSSE_PLATFORM": "-DWIN32_LEAN_AND_MEAN -DNOMINMAX",
+                "COMMONLIBSSE_TEXT": "-DUNICODE -D_UNICODE"
+            }
+        },
+        {
+            "name": "x64",
+            "hidden": true,
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            }
+        },
+        {
+            "name": "msvc",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_CXX_COMPILER": "cl.exe"
+            },
+            "environment": {
+                "COMMONLIBSSE_COMPILER": "/permissive- /Zc:preprocessor /EHsc $penv{CXXFLAGS} /MP",
+                "COMMONLIBSSE_TEXT": "-DUNICODE -D_UNICODE"
+            }
+        },
+        {
+            "name": "build-release-msvc",
+            "inherits": [
+                "base",
+                "vcpkg",
+                "win32-unicode",
+                "x64",
+                "msvc"
+            ],
+            "displayName": "Release",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/release-msvc",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": {
+                    "type": "STRING",
+                    "value": "Release"
+                },
+                "RFM_ENABLE_POST_BUILD_DEPLOY": {
+                    "type": "BOOL",
+                    "value": false
+                },
+                "RFM_DEPLOY_OUTPUT": {
+                    "type": "PATH",
+                    "value": ""
+                }
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release-msvc",
+            "displayName": "Release (MSVC)",
+            "configurePreset": "build-release-msvc"
+        }
+    ]
+}

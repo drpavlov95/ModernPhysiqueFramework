@@ -1,0 +1,18 @@
+# Build output
+build/
+vcpkg_installed/
+
+# Content packages - assets, not source. These live on the Nexus.
+release/
+outfit meshes/
+assets/
+
+# Physiques of Skyrim is the content mod, not the framework
+docs/Physiques_of_Skyrim_*
+MOD_PAGE.txt
+
+# Editor and scratch
+.vs/
+*.bak_*
+*.user
+docs/MPF_Nexus_Description.md

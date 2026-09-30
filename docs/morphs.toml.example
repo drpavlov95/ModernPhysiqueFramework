@@ -1,0 +1,54 @@
+# Copy this file into
+#
+#     Data\SKSE\Plugins\MPF\morphs\
+#
+# and rename it after your mod - MyPhysiqueMod.toml, not morphs.toml. MPF reads
+# every .toml in that folder, so yours sits beside everybody else's instead of
+# replacing it. The name is yours; only the extension matters.
+#
+# One [[sets]] block per TRI file. All three fields are required.
+#
+#   file   the TRI's filename, in this same folder. Prefix it with something of
+#          yours: every content mod shares this folder, and a generic name like
+#          FACE_FemaleHead.tri will collide with somebody else's.
+#
+#   sex    male | female
+#
+#   part   which kind of head part this TRI is for. These are the game's own
+#          BGSHeadPart types:
+#
+#              misc | face | eyes | hair | facialhair | scar | eyebrows
+#
+#          Declared rather than guessed from the filename, so the log tells you
+#          what the plugin thinks each file is.
+#
+# You never say which head mod you authored for. The plugin reads the vertex
+# count out of the TRI itself and then confirms the match against the live mesh's
+# own geometry, which is what separates COtR, High Poly COtR, High Poly Head,
+# Alternate High Poly Head and vanilla. A head nobody authored for is left alone.
+#
+# To cover two head mods, sculpt the morph on each one and ship two TRIs.
+
+
+[[sets]]
+file = "MYMOD_FemaleHead.tri"
+sex  = "female"
+part = "face"
+
+[[sets]]
+file = "MYMOD_MaleHead.tri"
+sex  = "male"
+part = "face"
+
+# Face parts follow the head they sit on. Ship a TRI for each one you want to
+# keep in place - brows, beards and the rest float on a morphed face otherwise.
+
+[[sets]]
+file = "MYMOD_FemaleBrows.tri"
+sex  = "female"
+part = "eyebrows"
+
+[[sets]]
+file = "MYMOD_MaleBeard.tri"
+sex  = "male"
+part = "facialhair"

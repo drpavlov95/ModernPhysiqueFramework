@@ -1,0 +1,165 @@
+[center][/center]
+[color=#e69138][size=5][b][u]- FEATURES[/u][/b][/size][/color]
+[list]
+[*][size=2]Applies face morphs to NPCs at runtime, paired (or not) with OBody presets - without baking FaceGen![/size][/*]
+[*][size=2]Works over both vanilla NPCs and NPC overhauls.[/size][/*]
+[*][size=2]Supports multiple INI files so content mods can remain independent.[/size][/*]
+[*][size=2]No per-NPC OBody JSON needed - the physique names the presets.[/size][/*]
+[*][size=2]Children are refused by the plugin, whatever the list says.[/size][/*]
+[*][size=2]Ships no morphs and no NPC list: on its own it changes nothing in your game.[/size][/*]
+[*][size=2]Open-source SKSE plugin.[/size][/*]
+[/list]
+
+[color=#e69138][size=5][b][u]- FOR MOD AUTHORS[/u][/b][/size][/color]
+
+[b]How to build:[/b]
+
+[b]1)[/b] Create a .tri file with your face morphs and place it in
+[code]Data\SKSE\Plugins\MPF\morphs\[/code]
+
+[b][color=#b45f06]Give it a unique filename![/color][/b] Every content mod shares this one folder, so a generic name like [size=2][font=Monaco, Menlo, Consolas, monospace]FACE_FemaleHead.tri[/font][/size] will be overwritten by the next mod that ships one. It is also good practice to prefix it with something of yours: [size=2][font=Monaco, Menlo, Consolas, monospace]MYMOD_FemaleHead.tri[/font][/size].
+
+
+[b]2)[/b] Create your own [size=2][font=Monaco, Menlo, Consolas, monospace].toml[/font][/size] manifest in that same folder and declare your .tri:
+
+[code][[sets]]
+file = "MYMOD_FemaleHead.tri"
+sex  = "female"          ; male | female
+part = "face"            ; misc | face | eyes | hair | facialhair | scar | eyebrows[/code]
+
+[b][color=#b45f06]Name it after your mod[/color][/b] - [size=2][font=Monaco, Menlo, Consolas, monospace]MYMOD_morphs.toml[/font][/size], not [size=2][font=Monaco, Menlo, Consolas, monospace]morphs.toml[/font][/size]. MPF reads every .toml in that folder, so yours sits beside everybody else's instead of replacing it. Copy [size=2][font=Monaco, Menlo, Consolas, monospace]Docs\morphs.toml.example[/font][/size] to start from a working file.
+
+[b]part[/b] says which kind of head part the TRI is for - [size=2][font=Monaco, Menlo, Consolas, monospace]face[/font][/size] for a head, [size=2][font=Monaco, Menlo, Consolas, monospace]eyebrows[/font][/size] for brows, [size=2][font=Monaco, Menlo, Consolas, monospace]facialhair[/font][/size] for beards, and so on. These are the game's own head part types.
+
+
+[b]3)[/b] Create a .ini file in [size=2][font=Monaco, Menlo, Consolas, monospace]Data\ModernPhysiqueFramework\[/font][/size] following the structure below.
+
+Name it after your mod, MPF reads every .ini in that folder, so you never edit anybody else's file:
+
+[code][Settings]
+Priority = 200
+
+[Physique.<NAME YOU PICKED FOR YOUR PHYSIQUE>]
+FaceMorph     = <the morph name inside your .tri>
+MalePresets   = Preset 01 | Preset 02
+FemalePresets = Preset 01 | Preset 02
+
+[Physique.Heavy]
+FaceMorph     = RLY_Heavy
+MalePresets   = MPP_Heavy
+FemalePresets = MPP_Heavy
+
+[NPCs]
+Name/ID = Weight, Physique
+Alvor   = 75, Heavy
+0x0001347F~Skyrim.esm = auto, Heavy
+
+[Factions]
+Faction name  = Weight, Physique, Distribution chance
+BanditFaction = 100, Heavy, 30%[/code]
+
+[b]- FaceMorph[/b] is the morph name [i]inside[/i] the .tri file, not a filename and not a BodySlide slider (although usually it is).
+[b]
+- MalePresets[/b] / [b]FemalePresets[/b] are OBody preset names and are optional - without them MPF still applies the face morph and skips OBody safely.
+
+- In [b][NPCs][/b] the value after the comma is the [b]physique[/b] - the name of a [size=2][font=Monaco, Menlo, Consolas, monospace][Physique.<name>][/font][/size] section - not a preset. Names are EditorIDs (they need po3's Tweaks); a FormID like [size=2][font=Monaco, Menlo, Consolas, monospace]0x0001347F~Skyrim.esm [/font][/size]works with nothing extra.
+
+[b]- Priority[/b] decides who wins when two files name the same NPC or physique: higher wins, and a tie is broken by filename, so the result never depends on load order. Physiques of Skyrim ships at 100 - go above it to override it without touching its files. Every conflict is written to the log.
+
+
+[color=#e69138][size=5][b][u]- WEIGHT IS PHYSIQUE STRENGTH, NOT FAT[/u][/b][/size][/color]
+
+[b]The single thing authors get wrong.[/b]
+
+The number in [size=2][font=Monaco, Menlo, Consolas, monospace][NPCs][/font][/size] is [b]not[/b] the vanilla fat slider. It is how strongly that physique is applied, from 0 (nothing) to 100 (the full morph).
+
+[code]Narfi = 95, Thin      ; 95% of the Thin morph - very thin
+Narfi = 40, Thin      ; 40% of the Thin morph - only slightly thin[/code]
+
+Writing a low number for a thin NPC gives you the opposite of what you meant: a low weight means [i]barely morphed[/i], not [i]very thin[/i].
+
+The same number scales the face morph, so the face and the body always agree - that is what keeps a heavy face on a heavy body without anyone authoring a second number. Use [size=2][font=Monaco, Menlo, Consolas, monospace]auto[/font][/size] to read the NPC's own record weight instead.
+
+
+[color=#e69138][size=5][b][u]- FOLDER STRUCTURE[/u][/b][/size][/color]
+
+In this page you'll install these files:
+
+[code]Data\
+├── SKSE\Plugins\
+│   ├── MPF.dll                                the plugin
+│   └── MPF\
+│       └── morphs\                            (empty - content mods fill it)
+├── ModernPhysiqueFramework\                   (empty - content mods fill it)
+└── Docs\
+    ├── ModernPhysiqueFramework.schema.ini     the INI format, fully commented
+    └── morphs.toml.example                    copy this to start your manifest[/code]
+
+[b]And your mod should look like this:[/b]
+
+[code]MyPhysiqueMod\
+├── SKSE\
+│   └── Plugins\
+│       └── MPF\
+│           └── morphs\
+│               ├── MYMOD_FemaleHead.tri       your morphs - use a unique filename!
+│               ├── MYMOD_MaleHead.tri
+│               └── MYMOD_morphs.toml          your manifest - name it after your mod
+└── ModernPhysiqueFramework\
+    └── MyPhysiqueMod.ini                      your NPC list and physiques[/code]
+
+That is the whole mod. Zip it from [size=2][font=Monaco, Menlo, Consolas, monospace]MyPhysiqueMod\[/font][/size] and it installs like any other - no ESP needed, no FaceGen, no scripts.
+
+NOTES:
+
+[list]
+[*][size=2][b]The .tri filename is yours to choose,[/b] nothing is inferred from it. But every mod shares this one folder, so prefix it to avoid conflicts![/size][/*]
+[*][size=2][b]The manifest is yours too.[/b] MPF reads every .toml in that folder, so name it after your mod and it never replaces anybody else's.[/size][/*]
+[*][size=2][b]The INI is yours alone.[/b] MPF reads every .ini in that folder, recursively, and resolves conflicts by Priority - you never edit another mod's file.[/size][/*]
+[/list]
+
+[b]You never declare which head mod you authored for[/b]
+
+There is no "topology" field anywhere. Sculpt the morph on the head you want to
+support, save the .tri from that mesh, and the plugin works the rest out:
+
+[list=1]
+[*][size=2][b]Vertex count[/b] - read from your .tri, not declared. This alone separates COtR,
+High Poly COtR, High Poly Head, Alternate High Poly Head and vanilla.[/size][/*]
+[*][size=2][b]Shape[/b] - the live mesh is compared against your .tri's rest pose, with the mean
+position removed so it compares form, not world position. Too far apart and your
+set is refused for that head.[/size][/*]
+[/list]
+
+Want to cover two head mods? Ship two .tri files, one sculpted on each. A head
+nobody authored for is left alone - it does not break, it just does not change.
+
+
+
+[color=#e69138][size=5][b][u]- REQUIREMENTS[/u][/b][/size][/color]
+
+[list]
+[*][size=2]SKSE[/size][/*]
+[*][size=2]Address Library for SKSE Plugins.[/size][/*]
+[*][size=2]OBody NG is optional and only needed for preset assignment.[/size][/*]
+[*][size=2]po3's Tweaks is optional, only needed to write EditorIDs instead of FormIDs.[/size][/*]
+[/list]
+
+
+[color=#e69138][size=5][b][u]- INSTALLATION[/u][/b][/size][/color]
+
+Install MPF once, then install any content mod that supports it. Do not merge or rename content INIs or manifests from different mods. MPF loads every INI under [size=2][font=Monaco, Menlo, Consolas, monospace]Data\ModernPhysiqueFramework\[/font][/size] and every .toml under [size=2][font=Monaco, Menlo, Consolas, monospace]Data\SKSE\Plugins\MPF\morphs\[/font][/size], and resolves conflicts deterministically.
+
+
+[color=#e69138][size=5][b][u]- COMPATIBILITY[/u][/b][/size][/color]
+
+MPF does not replace FaceGen, edit NPC records permanently, or require a specific NPC replacer.
+Outfit distribution and body assets belong to the content mod.
+
+
+[color=#e69138][size=5][b][u]- CREDITS[/u][/b][/size][/color]
+
+[center]OBody NG API by its respective authors.
+CommonLibSSE-NG and the SKSE plugin community.
+
+Source code: [url=SOURCE_URL]GitHub repository[/url][/center]
