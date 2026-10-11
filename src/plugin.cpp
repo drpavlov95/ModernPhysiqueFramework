@@ -2,8 +2,7 @@
 // Modern Physique Framework - applies named TRI morphs to an NPC's head at runtime,
 // on top of whatever FaceGeom NIF the load order produced.
 //
-// It never regenerates FaceGen, never touches an NPC record, never touches the
-// face tint, and writes nothing to the save. That is the whole point: the two
+// It never regenerates FaceGen and never touches the face tint. That is the whole point: the two
 // failure modes people hit when they morph NPC faces - the head reverting to
 // vanilla, and the black face bug - both come from *regenerating* the head.
 // This adds per-vertex deltas to the base morph buffer ("FOD") of the head that
@@ -23,15 +22,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <thread>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -43,13 +46,21 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <toml++/toml.hpp>
 
+#include "bodytri.h"
+#include "ini_edit.h"
+#include "menu.h"
 #include "tri.h"
+#include "third_party/skee/SKEE.h"
 
-// OBody's public plugin API deliberately leaves the game types undefined so
-// consumers can supply the aliases from whichever SKSE/CommonLib they use.
-using Actor = RE::Actor;
-using TESForm = RE::TESForm;
-#include "third_party/obody/API.h"
+#ifndef MPF_VERSION
+#	define MPF_VERSION "unknown"
+#endif
+#ifndef MPF_BUILD_ID
+#	define MPF_BUILD_ID "unknown"
+#endif
+#ifndef MPF_BODY_BACKEND
+#	define MPF_BODY_BACKEND "unknown"
+#endif
 
 namespace
 {
@@ -68,15 +79,15 @@ namespace
 	};
 	static_assert(sizeof(BSFaceGenBaseMorphExtraData) == 0x28);
 
-	// F6/F7 deliberately: the throwaway FaceProbe diagnostic sits on F8-F12, and
+	// F6/Shift+F7 deliberately: the throwaway FaceProbe diagnostic sits on F8-F12, and
 	// the two need to be usable in the same session.
 	constexpr std::uint32_t kKeyApply = 0x40;   // F6 - apply now, for testing
-	constexpr std::uint32_t kKeyReport = 0x41;  // F7 - say what would be applied
+	constexpr std::uint32_t kKeyReport = 0x41;  // Shift+F7 - say what would be applied
 
 	struct MorphRequest
 	{
 		std::string name;
-		float       weight{ 0.0f };
+		float       scale{ 1.0f };
 	};
 
 	struct NpcEntry
@@ -84,14 +95,17 @@ namespace
 		std::string               targetText;
 		RE::FormID                baseFormID{ 0 };
 		std::string               physique;
+		std::string               bodyMorph;
 		std::vector<MorphRequest> morphs;
 		int                       priority{ 0 };
 		std::string               sourceFile;
-		// The weight from the list, 0-100, on the same scale as the vanilla
-		// slider: it is the whole strength of the morph, one to one. A negative
-		// value means "auto", which reads the NPC's own record weight instead,
-		// for setups that drive weight from somewhere else.
-		float                     weight{ -1.0f };
+		std::string               sourcePath;
+		bool                      fromFaction{ false };
+		// Physique strength from the list, 0-100. It drives the face and body
+		// morphs together without changing Skyrim's engine weight. A negative value
+		// means "auto": use the original record weight as morph strength.
+		float                     strength{ -1.0f };
+		bool                      strengthFromRecord{ false };
 		// What [Outfits] and [Skins] named for this NPC, verbatim. Resolved late,
 		// not here, because a name only resolves once the load order is up.
 		std::string               outfitText;
@@ -169,23 +183,50 @@ namespace
 	// third-party profiles are all data supplied by [Physique.<name>] sections.
 	struct PhysiqueDefinition
 	{
-		std::string              name;
-		std::string              faceMorph;
-		std::vector<std::string> malePresets;
-		std::vector<std::string> femalePresets;
-		int                      priority{ 0 };
-		std::string              sourceFile;
+		std::string name;
+		std::string faceMorph;
+		std::string bodyMorph;
+		int         priority{ 0 };
+		std::string sourceFile;
+		std::string sourcePath;
 	};
 
 	// Lower-cased physique name -> definition. Names are case-insensitive in the
-	// editable lists while preset and morph names retain their exact case.
+	// editable lists while morph names retain their exact case.
 	std::unordered_map<std::string, PhysiqueDefinition> g_physiques;
-	OBody::API::IPluginInterface*                    g_obodyAPI{ nullptr };
-	std::atomic_bool                                 g_obodyReady{ false };
+	std::unordered_map<RE::FormID, std::vector<NpcEntry>> g_entryCandidates;
+
+	struct SourceInfo
+	{
+		std::filesystem::path path;
+		std::string           name;
+		std::string           author;
+		int                   priority{ 0 };
+		std::size_t           directEntries{ 0 };
+		std::size_t           factionRules{ 0 };
+		std::size_t           conflictsWon{ 0 };
+	};
+	std::unordered_map<std::string, SourceInfo> g_sources;
+	SKEE::IBodyMorphInterface*                       g_bodyMorphAPI{ nullptr };
 	std::atomic_bool                                 g_dataLoaded{ false };
-	// Reference -> preset. Accessed only from game-thread tasks.
-	std::unordered_map<RE::FormID, std::string>      g_obodySynced;
-	std::unordered_set<RE::FormID>                   g_obodyFailed;
+	std::atomic_uint64_t                             g_loadGeneration{ 0 };
+	constexpr std::string_view                       kBodyMorphKey = "MPF";
+	// Body state is tracked per reference, not as one process-wide "already done"
+	// bit.  Apart from making reloads idempotent, this lets us distinguish a
+	// target that is already correct from a target that changed while the same
+	// 3D instance was alive.
+	struct BodyApplyState
+	{
+		RE::FormID baseFormID{ 0 };
+		std::string morph;
+		float       strength{ 0.0f };
+		bool        compatible{ false };
+		std::uint64_t generation{ 0 };
+	};
+	std::unordered_map<RE::FormID, BodyApplyState>   g_bodyApplied;
+	// A user-configurable seed changes random faction assignments intentionally,
+	// while the actor/form identity keeps them stable across reloads and saves.
+	std::uint32_t                                    g_randomSeed{ 0x4D504631u };
 	// Guard against writing into the same buffer twice. It is deliberately keyed
 	// on the buffer, not on the actor: two references of the same base NPC (two
 	// console-spawned copies, say) can share one head, and a per-actor guard
@@ -214,6 +255,17 @@ namespace
 	std::unordered_set<RE::FormID>                                           g_counted;
 	std::unordered_set<RE::FormID>                                           g_announced;
 
+	struct CachedBodyTri
+	{
+		bool              loaded{ false };
+		rfm::BodyTriIndex index;
+		std::string       error;
+	};
+
+	// Populated only when the user presses Shift+F7. Normal application never opens or
+	// indexes a body TRI, and each distinct asset is read at most once per game.
+	std::unordered_map<std::string, CachedBodyTri> g_bodyTriDiagnostics;
+
 	// Whole groups, for the NPCs nobody can name.
 	//
 	// A bandit or a random farmer is spawned from a levelled list with a base the
@@ -229,10 +281,14 @@ namespace
 	{
 		std::string text;          // what the file said, for the log
 		RE::FormID  factionID{ 0 };
-		float       weight{ 100.0f };
+		float       strength{ 100.0f };
+		bool        automaticStrength{ false };
+		bool        randomStrength{ false };
 		int         percent{ 100 };
 		std::string physique;
+		bool        randomPhysique{ false };
 		std::string sourceFile;
+		std::string sourcePath;
 		int         priority{ 0 };
 	};
 
@@ -255,8 +311,21 @@ namespace
 
 	std::string                                                              g_skinMaleText;
 	std::string                                                              g_skinFemaleText;
+	int                                                                      g_skinMalePriority = (std::numeric_limits<int>::min)();
+	int                                                                      g_skinFemalePriority = (std::numeric_limits<int>::min)();
+	std::string                                                              g_skinMaleSource;
+	std::string                                                              g_skinFemaleSource;
 	bool                                                                     g_verbose = false;
 	bool                                                                     g_diagnostics = false;
+	bool                                                                     g_userLoggingExplicit = false;
+	std::string                                                              g_menuStatus;
+
+	struct OriginalNpcRecord
+	{
+		RE::TESObjectARMO* skin{ nullptr };
+		RE::BGSOutfit*     outfit{ nullptr };
+	};
+	std::unordered_map<RE::FormID, OriginalNpcRecord>                        g_originalNpcRecords;
 
 	// How far the rest-pose vertices of a morph set may sit from the geometry's
 	// base buffer, once both are centred, and still be judged the same mesh.
@@ -272,6 +341,58 @@ namespace
 	std::filesystem::path ConfigPath(std::string_view a_relative = {})
 	{
 		return std::filesystem::path("Data/ModernPhysiqueFramework") / a_relative;
+	}
+
+	std::filesystem::path RuntimeSettingsPath()
+	{
+		return DataPath("settings.ini");
+	}
+
+	std::string SourceKey(const std::filesystem::path& a_path)
+	{
+		return Lowered(a_path.lexically_normal().generic_string());
+	}
+
+	void Trim(std::string& a_text);
+
+	void LoadRuntimeSettings()
+	{
+		g_userLoggingExplicit = false;
+		g_verbose = false;
+		g_diagnostics = false;
+		g_randomSeed = 0x4D504631u;
+		const auto path = RuntimeSettingsPath();
+		std::error_code ec;
+		if (!std::filesystem::is_regular_file(path, ec)) {
+			return;
+		}
+		CSimpleIniA ini(false, true, false);
+		ini.SetUnicode();
+		if (ini.LoadFile(path.string().c_str()) < 0) {
+			spdlog::warn("{}: cannot be read; using normal logging", path.string());
+			return;
+		}
+		std::string level = ini.GetValue("Runtime", "Logging", "");
+		Trim(level);
+		level = Lowered(level);
+		if (level == "normal" || level == "verbose" || level == "diagnostic") {
+			g_userLoggingExplicit = true;
+			g_verbose = level == "verbose" || level == "diagnostic";
+			g_diagnostics = level == "diagnostic";
+		}
+		const auto configuredSeed = ini.GetLongValue(
+			"Runtime",
+			"RandomSeed",
+			static_cast<long>(g_randomSeed));
+		if (configuredSeed >= 0) {
+			g_randomSeed = static_cast<std::uint32_t>(
+				static_cast<unsigned long>(configuredSeed) & 0xFFFFFFFFul);
+		} else {
+			spdlog::warn("{}: Runtime.RandomSeed must be a non-negative integer; using default 0x{:08X}",
+				path.string(), g_randomSeed);
+		}
+		spdlog::info("runtime settings: logging={} randomSeed=0x{:08X}",
+			level.empty() ? "normal" : level, g_randomSeed);
 	}
 
 	void SetupLog()
@@ -340,22 +461,39 @@ namespace
 			// Two manifests naming the same TRI would load the same geometry
 			// twice, and PickSet would then weigh a duplicate against itself.
 			// The first one named wins, and the log says which.
-			const auto key = Lowered(file);
-			if (const auto [it, fresh] = a_seen.insert(key); !fresh) {
-				spdlog::info("{}: '{}' was already declared by another manifest - skipped", name, file);
+			const std::filesystem::path relative(file);
+			const bool escapesFolder = relative.is_absolute() ||
+				std::ranges::any_of(relative, [](const auto& component) { return component == ".."; });
+			if (escapesFolder) {
+				spdlog::error("{}: morph file '{}' must be a relative path inside the morph folder",
+					name, file);
+				continue;
+			}
+			const auto triPath = (a_path.parent_path() / relative).lexically_normal();
+			auto displayPath = triPath.lexically_relative(a_dir).generic_string();
+			if (displayPath.empty()) {
+				displayPath = file;
+			}
+			const auto key = Lowered(displayPath);
+			if (a_seen.contains(key)) {
+				spdlog::info("{}: '{}' was already declared by another manifest - skipped",
+					name, displayPath);
 				continue;
 			}
 
 			rfm::TriFile tri;
 			std::string  error;
-			if (!tri.Load(a_dir / file, error)) {
-				spdlog::error("{}: morph file '{}' refused: {}", name, file, error);
+			if (!tri.Load(triPath, error)) {
+				spdlog::error("{}: morph file '{}' refused: {}", name, displayPath, error);
 				continue;
 			}
+			// Do not reserve a name until it loaded successfully. Otherwise a broken
+			// declaration in one content mod can prevent a later valid one from loading.
+			a_seen.insert(key);
 			const LibraryKey libKey{ sex == "female", tri.VertexCount() };
 			spdlog::info("morphs '{}' ({}): sex={} part={} verts={} morphs={}",
-				file, name, sex, PartTypeName(partType), tri.VertexCount(), tri.MorphNames().size());
-			g_library[libKey].push_back(LibraryEntry{ file, partType, std::move(tri) });
+				displayPath, name, sex, PartTypeName(partType), tri.VertexCount(), tri.MorphNames().size());
+			g_library[libKey].push_back(LibraryEntry{ displayPath, partType, std::move(tri) });
 			++loaded;
 		}
 		return loaded;
@@ -375,10 +513,14 @@ namespace
 		}
 
 		std::vector<std::filesystem::path> manifests;
-		for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
-			if (entry.is_regular_file() && entry.path().extension() == ".toml") {
+		for (const auto& entry : std::filesystem::recursive_directory_iterator(
+				dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+			if (entry.is_regular_file() && Lowered(entry.path().extension().string()) == ".toml") {
 				manifests.push_back(entry.path());
 			}
+		}
+		if (ec) {
+			spdlog::warn("could not inspect every entry under {}: {}", dir.string(), ec.message());
 		}
 		// Sorted so the "first one named wins" rule above means the same thing on
 		// every machine, rather than whatever order the file system hands back.
@@ -397,22 +539,114 @@ namespace
 		spdlog::info("{} morph set(s) loaded from {} manifest(s)", sets, manifests.size());
 	}
 
+	void Trim(std::string& a_text)
+	{
+		while (!a_text.empty() && std::isspace(static_cast<unsigned char>(a_text.front()))) {
+			a_text.erase(a_text.begin());
+		}
+		while (!a_text.empty() && std::isspace(static_cast<unsigned char>(a_text.back()))) {
+			a_text.pop_back();
+		}
+	}
+
+	std::string CleanValue(std::string a_text)
+	{
+		if (const auto comment = a_text.find(';'); comment != std::string::npos) {
+			a_text.erase(comment);
+		}
+		Trim(a_text);
+		return a_text;
+	}
+
+	void AssignGlobalSetting(const char* a_name, std::string a_value, int a_priority,
+		const std::string& a_source, std::string& a_current, int& a_currentPriority,
+		std::string& a_currentSource)
+	{
+		a_value = CleanValue(std::move(a_value));
+		if (a_value.empty()) {
+			return;
+		}
+		const bool replace = a_priority > a_currentPriority ||
+			(a_priority == a_currentPriority &&
+				(a_currentSource.empty() || a_source < a_currentSource));
+		if (!a_current.empty()) {
+			spdlog::info("setting {} conflict: '{}' (p{}) vs '{}' (p{}) -> {} wins",
+				a_name, a_source, a_priority, a_currentSource, a_currentPriority,
+				replace ? a_source : a_currentSource);
+		}
+		if (replace) {
+			a_current = std::move(a_value);
+			a_currentPriority = a_priority;
+			a_currentSource = a_source;
+		}
+	}
+
+	bool ParseFloatStrict(std::string a_text, float& a_value)
+	{
+		Trim(a_text);
+		if (a_text.empty()) {
+			return false;
+		}
+		try {
+			std::size_t consumed = 0;
+			a_value = std::stof(a_text, &consumed);
+			return consumed == a_text.size() && std::isfinite(a_value);
+		} catch (const std::exception&) {
+			return false;
+		}
+	}
+
+	bool ParseIntStrict(std::string a_text, int& a_value)
+	{
+		Trim(a_text);
+		if (a_text.empty()) {
+			return false;
+		}
+		try {
+			std::size_t consumed = 0;
+			a_value = std::stoi(a_text, &consumed);
+			return consumed == a_text.size();
+		} catch (const std::exception&) {
+			return false;
+		}
+	}
+
 	// "0x00013479~Skyrim.esm", or an EditorID when po3's Tweaks is installed.
 	RE::FormID ResolveTarget(const std::string& a_text)
 	{
-		const auto tilde = a_text.find('~');
+		std::string text = a_text;
+		Trim(text);
+		if (text.empty()) {
+			return 0;
+		}
+		const auto tilde = text.find('~');
 		if (tilde != std::string::npos) {
-			const auto idText = a_text.substr(0, tilde);
-			const auto plugin = a_text.substr(tilde + 1);
+			std::string idText = text.substr(0, tilde);
+			std::string plugin = text.substr(tilde + 1);
+			Trim(idText);
+			Trim(plugin);
+			if (idText.empty() || plugin.empty()) {
+				return 0;
+			}
 			auto*      handler = RE::TESDataHandler::GetSingleton();
 			if (!handler) {
 				return 0;
 			}
-			const auto localID = static_cast<RE::FormID>(std::strtoul(idText.c_str(), nullptr, 16));
+			if (idText.front() == '+' || idText.front() == '-') {
+				return 0;
+			}
+			errno = 0;
+			char* end = nullptr;
+			const auto parsed = std::strtoul(idText.c_str(), &end, 16);
+			if (errno == ERANGE || end == idText.c_str() || *end != '\0' ||
+				parsed > (std::numeric_limits<RE::FormID>::max)()) {
+				return 0;
+			}
+			const auto localID = static_cast<RE::FormID>(parsed);
 			auto*      form = handler->LookupForm(localID, plugin);
 			return form ? form->GetFormID() : 0;
 		}
-		auto* form = RE::TESForm::LookupByEditorID(a_text);
+		auto* form = RE::TESForm::LookupByEditorID(text);
 		return form ? form->GetFormID() : 0;
 	}
 
@@ -432,7 +666,7 @@ namespace
 		CSimpleIniA::TNamesDepend keys;
 		ini.GetAllKeys("Factions", keys);
 		for (const auto& key : keys) {
-			const auto id = ResolveTarget(ini.GetValue("Factions", key.pItem, ""));
+			const auto id = ResolveTarget(CleanValue(ini.GetValue("Factions", key.pItem, "")));
 			if (id != 0 && key.pItem) {
 				g_factionNames[Lowered(key.pItem)] = id;
 			}
@@ -454,12 +688,14 @@ namespace
 	//
 	//     BanditFaction    = 100, Muscular          every record in the faction
 	//     ForswornFaction  = 100, Heavy, 25%        a stable quarter of them
-	//     JobFarmerFaction = 80, Thin
+	//     JobFarmerFaction = auto, Thin
+	//     BanditFaction    = random, random          random strength and physique
 	//
-	// Same value shape as [NPCs] - a weight and required physique - plus a
-	// percentage, which is what makes "random bandits" possible without the result
-	// changing every time the game starts.
-	void LoadGroupRules(CSimpleIniA& a_ini, const std::string& a_file, int a_priority)
+	// Same value shape as [NPCs] - a morph strength and required physique - plus a
+	// percentage. 'random' is deterministic per faction record: it distributes
+	// records without reshuffling them every time the game starts.
+	void LoadGroupRules(CSimpleIniA& a_ini, const std::string& a_file,
+		const std::string& a_sourcePath, int a_priority)
 	{
 		CSimpleIniA::TNamesDepend keys;
 		a_ini.GetAllKeys("Factions", keys);
@@ -467,6 +703,7 @@ namespace
 			GroupRule rule;
 			rule.text = key.pItem ? key.pItem : "";
 			rule.sourceFile = a_file;
+			rule.sourcePath = a_sourcePath;
 			rule.priority = a_priority;
 			if (rule.text.empty()) {
 				continue;
@@ -475,88 +712,66 @@ namespace
 			if (const auto comment = value.find(';'); comment != std::string::npos) {
 				value.erase(comment);
 			}
+			std::vector<std::string> fields;
 			std::stringstream parts(value);
-			std::string       token;
-			bool              first = true;
-			bool              bad = false;
-			bool              hasPhysique = false;
+			std::string token;
 			while (std::getline(parts, token, ',')) {
-				while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) token.erase(token.begin());
-				while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.pop_back();
-				if (token.empty()) {
-					continue;
-				}
-				if (first) {
-					try {
-						rule.weight = std::stof(token);
-					} catch (const std::exception&) {
-						bad = true;
-					}
-					first = false;
-				} else if (token.back() == '%') {
-					try {
-						rule.percent = std::stoi(token.substr(0, token.size() - 1));
-					} catch (const std::exception&) {
-						bad = true;
-					}
-				} else if (!hasPhysique) {
-					rule.physique = token;
-					hasPhysique = true;
+				Trim(token);
+				fields.push_back(token);
+			}
+			bool bad = fields.size() < 2 || fields.size() > 3 ||
+				std::ranges::any_of(fields, [](const auto& field) { return field.empty(); });
+			if (!bad) {
+				const auto strengthText = Lowered(fields[0]);
+				if (strengthText == "auto") {
+					rule.automaticStrength = true;
+					rule.strength = -1.0f;
+				} else if (strengthText == "random") {
+					rule.randomStrength = true;
+					rule.strength = 0.0f;
 				} else {
-					bad = true;
+					bad = !ParseFloatStrict(fields[0], rule.strength);
+				}
+				rule.physique = fields[1];
+				rule.randomPhysique = Lowered(rule.physique) == "random";
+				if (fields.size() == 3) {
+					if (!fields[2].ends_with('%')) {
+						bad = true;
+					} else {
+						fields[2].pop_back();
+						bad = !ParseIntStrict(fields[2], rule.percent);
+					}
 				}
 			}
-			if (bad || !hasPhysique || rule.physique.empty() ||
-				rule.weight < 0.0f || rule.weight > 100.0f ||
+			if (bad || rule.physique.empty() ||
+				(!rule.randomStrength && !rule.automaticStrength && rule.strength < 0.0f) ||
+				(!rule.randomStrength && !rule.automaticStrength && rule.strength > 100.0f) ||
 				rule.percent < 0 || rule.percent > 100) {
-				spdlog::error("{}: [Factions] '{}' = '{}' must be weight, physique and "
+				spdlog::error("{}: [Factions] '{}' = '{}' must be strength, physique and "
 					"an optional percentage", a_file, rule.text, value);
 				continue;
 			}
 			// Resolved later, in ExpandGroupRules: the name table is loaded after
 			// the lists are read, and tying the two together by load order is the
 			// kind of dependency that breaks quietly.
-			spdlog::info("   faction {:<28} weight {:g}, physique '{}', {}%", rule.text,
-				rule.weight, rule.physique, rule.percent);
+			const auto strengthLabel = rule.randomStrength ? std::string("random") :
+				rule.automaticStrength ? std::string("auto") : std::format("{:g}", rule.strength);
+			const auto physiqueLabel = rule.randomPhysique ? std::string("random") : rule.physique;
+			spdlog::info("   faction {:<28} strength {}, physique '{}', {}%", rule.text,
+				strengthLabel, physiqueLabel, rule.percent);
 			g_groups.push_back(std::move(rule));
 		}
 	}
 
-	void Trim(std::string& a_text)
-	{
-		while (!a_text.empty() && std::isspace(static_cast<unsigned char>(a_text.front()))) {
-			a_text.erase(a_text.begin());
-		}
-		while (!a_text.empty() && std::isspace(static_cast<unsigned char>(a_text.back()))) {
-			a_text.pop_back();
-		}
-	}
-
-	std::vector<std::string> ParsePresetPool(std::string a_value)
-	{
-		if (const auto comment = a_value.find(';'); comment != std::string::npos) {
-			a_value.erase(comment);
-		}
-		std::vector<std::string> result;
-		std::stringstream values(a_value);
-		std::string preset;
-		while (std::getline(values, preset, '|')) {
-			Trim(preset);
-			if (!preset.empty()) {
-				result.push_back(std::move(preset));
-			}
-		}
-		return result;
-	}
-
 	// [Physique.Heavy]
 	// FaceMorph = RLY_Heavy
-	// MalePresets = Runtime Morphs Heavy Male 01 | Runtime Morphs Heavy Male 02
-	// FemalePresets = Runtime Morphs Heavy Female 01
+	// BodyMorph = RM_Heavy
 	//
-	// Section suffixes are user-defined and case-insensitive. Preset pools are
-	// optional (the standalone build has none), but FaceMorph is required.
-	void LoadPhysiques(CSimpleIniA& a_ini, const std::string& a_file, int a_priority)
+	// Section suffixes are user-defined and case-insensitive. BodyMorph is the
+	// RaceMenu body-morph slider name in the TRI; it is optional for face-only
+	// profiles. FaceMorph remains required.
+	void LoadPhysiques(CSimpleIniA& a_ini, const std::string& a_file,
+		const std::string& a_sourcePath, int a_priority)
 	{
 		CSimpleIniA::TNamesDepend sections;
 		a_ini.GetAllSections(sections);
@@ -572,15 +787,17 @@ namespace
 			Trim(candidate.name);
 			candidate.priority = a_priority;
 			candidate.sourceFile = a_file;
+			candidate.sourcePath = a_sourcePath;
 			candidate.faceMorph = a_ini.GetValue(sectionName.c_str(), "FaceMorph", "");
 			if (const auto comment = candidate.faceMorph.find(';'); comment != std::string::npos) {
 				candidate.faceMorph.erase(comment);
 			}
 			Trim(candidate.faceMorph);
-			candidate.malePresets = ParsePresetPool(
-				a_ini.GetValue(sectionName.c_str(), "MalePresets", ""));
-			candidate.femalePresets = ParsePresetPool(
-				a_ini.GetValue(sectionName.c_str(), "FemalePresets", ""));
+			candidate.bodyMorph = a_ini.GetValue(sectionName.c_str(), "BodyMorph", "");
+			if (const auto comment = candidate.bodyMorph.find(';'); comment != std::string::npos) {
+				candidate.bodyMorph.erase(comment);
+			}
+			Trim(candidate.bodyMorph);
 
 			if (candidate.name.empty() || candidate.faceMorph.empty()) {
 				spdlog::error("{}: [{}] requires a physique name and FaceMorph", a_file, sectionName);
@@ -611,10 +828,9 @@ namespace
 	//     0x0001347F~Skyrim.esm = 80, Thin
 	//     Gerdur = auto, Heavy
 	//
-	// The number is the NPC's weight on the vanilla 0-100 scale and it is the
-	// entire strength of the morph, one to one. Adding somebody is a line;
-	// removing them is deleting the line. "auto" reads the record's own weight,
-	// for setups that already drive weight from somewhere else.
+	// The number is the physique percentage on a 0-100 scale and drives the face
+	// and body morphs one to one. "auto" reads the original record weight and
+	// uses that value as morph strength without changing the weight.
 	void LoadPatchFile(const std::filesystem::path& a_path)
 	{
 		CSimpleIniA ini(false, true, false);
@@ -626,37 +842,54 @@ namespace
 		}
 
 		const int priority = static_cast<int>(ini.GetLongValue("Settings", "Priority", 0));
-		if (ini.GetBoolValue("Settings", "Diagnostics", false)) {
+		const auto sourcePath = a_path.lexically_normal().generic_string();
+		auto displayName = CleanValue(ini.GetValue("Settings", "Name", ""));
+		if (displayName.empty()) {
+			displayName = a_path.stem().string();
+		}
+		SourceInfo source;
+		source.path = a_path.lexically_normal();
+		source.name = std::move(displayName);
+		source.author = CleanValue(ini.GetValue("Settings", "Author", ""));
+		source.priority = priority;
+		g_sources.insert_or_assign(SourceKey(a_path), std::move(source));
+
+		if (!g_userLoggingExplicit && ini.GetBoolValue("Settings", "Diagnostics", false)) {
 			g_diagnostics = true;
 		}
-		if (const auto* v = ini.GetValue("Settings", "SkinMale", ""); v && *v) {
-			g_skinMaleText = v;
-		}
-		if (const auto* v = ini.GetValue("Settings", "SkinFemale", ""); v && *v) {
-			g_skinFemaleText = v;
-		}
+		AssignGlobalSetting("SkinMale", ini.GetValue("Settings", "SkinMale", ""),
+			priority, fileName, g_skinMaleText, g_skinMalePriority, g_skinMaleSource);
+		AssignGlobalSetting("SkinFemale", ini.GetValue("Settings", "SkinFemale", ""),
+			priority, fileName, g_skinFemaleText, g_skinFemalePriority, g_skinFemaleSource);
 
-		LoadPhysiques(ini, fileName, priority);
-		LoadGroupRules(ini, fileName, priority);
+		LoadPhysiques(ini, fileName, sourcePath, priority);
+		LoadGroupRules(ini, fileName, sourcePath, priority);
+		if (auto found = g_sources.find(SourceKey(a_path)); found != g_sources.end()) {
+			CSimpleIniA::TNamesDepend groupKeys;
+			ini.GetAllKeys("Factions", groupKeys);
+			found->second.factionRules = groupKeys.size();
+		}
 
 		CSimpleIniA::TNamesDepend keys;
 		ini.GetAllKeys("NPCs", keys);
 		if (keys.empty()) {
-			spdlog::warn("{}: no [NPCs] section, or it is empty", fileName);
+			spdlog::info("{}: no direct [NPCs] entries", fileName);
 			return;
 		}
 
 		for (const auto& key : keys) {
 			NpcEntry entry;
 			entry.sourceFile = fileName;
+			entry.sourcePath = sourcePath;
 			entry.priority = priority;
 			entry.targetText = key.pItem ? key.pItem : "";
+			Trim(entry.targetText);
 			if (entry.targetText.empty()) {
 				continue;
 			}
 
 			// SimpleIni does not strip trailing comments from values, so cut one
-			// before splitting the required "weight, physique" pair.
+			// before splitting the required "strength, physique" pair.
 			const auto uncomment = [](std::string t) {
 				if (const auto c = t.find(';'); c != std::string::npos) {
 					t.erase(c);
@@ -664,11 +897,11 @@ namespace
 				return t;
 			};
 
-			// "<weight>, <physique>" -- both fields are required.
+			// "<strength>, <physique>" -- both fields are required.
 			std::string value = uncomment(ini.GetValue("NPCs", key.pItem, ""));
 			const auto comma = value.find(',');
 			if (comma == std::string::npos || value.find(',', comma + 1) != std::string::npos) {
-				spdlog::error("{}: '{}' must be written as weight, physique", fileName,
+				spdlog::error("{}: '{}' must be written as strength, physique", fileName,
 					entry.targetText);
 				continue;
 			}
@@ -677,19 +910,18 @@ namespace
 			Trim(value);
 			Trim(entry.physique);
 
-			if (value == "auto" || value == "AUTO") {
-				entry.weight = -1.0f;
+			if (Lowered(value) == "auto") {
+				entry.strength = -1.0f;
+				entry.strengthFromRecord = true;
 			} else {
-				try {
-					entry.weight = std::stof(value);
-				} catch (const std::exception&) {
-					spdlog::error("{}: '{}' has value '{}', which is neither a weight nor 'auto'",
+				if (!ParseFloatStrict(value, entry.strength)) {
+					spdlog::error("{}: '{}' has value '{}', which is neither a strength nor 'auto'",
 						fileName, entry.targetText, value);
 					continue;
 				}
-				if (entry.weight < 0.0f || entry.weight > 100.0f) {
-					spdlog::error("{}: '{}' has weight {:.1f}; the scale is 0 to 100", fileName,
-						entry.targetText, entry.weight);
+				if (entry.strength < 0.0f || entry.strength > 100.0f) {
+					spdlog::error("{}: '{}' has strength {:.1f}; the scale is 0 to 100", fileName,
+						entry.targetText, entry.strength);
 					continue;
 				}
 			}
@@ -703,6 +935,8 @@ namespace
 			// the default skin, which is what makes adding a name to [NPCs] enough.
 			entry.outfitText = uncomment(ini.GetValue("Outfits", key.pItem, ""));
 			entry.skinText = uncomment(ini.GetValue("Skins", key.pItem, ""));
+			Trim(entry.outfitText);
+			Trim(entry.skinText);
 
 			entry.baseFormID = ResolveTarget(entry.targetText);
 			if (entry.baseFormID == 0) {
@@ -710,13 +944,22 @@ namespace
 					fileName, entry.targetText);
 				continue;
 			}
+			if (!RE::TESForm::LookupByID<RE::TESNPC>(entry.baseFormID)) {
+				spdlog::warn("{}: target '{}' resolved to 0x{:08X}, but it is not an NPC",
+					fileName, entry.targetText, entry.baseFormID);
+				continue;
+			}
 			// What a name resolved to is worth writing down. A name always
 			// resolves to something, so "57 loaded" says nothing about whether
 			// they are the NPCs the author meant - and an entry that resolved to
 			// the wrong form looks exactly like an entry that works.
-			spdlog::info("   {:<26} -> 0x{:08X}  weight {}, physique '{}'", entry.targetText,
-				entry.baseFormID, entry.weight < 0.0f ? std::string("from the record") :
-				std::format("{:g}", entry.weight), entry.physique);
+			spdlog::info("   {:<26} -> 0x{:08X}  strength {}, physique '{}'", entry.targetText,
+				entry.baseFormID, entry.strength < 0.0f ? std::string("from the record") :
+				std::format("{:g}", entry.strength), entry.physique);
+			g_entryCandidates[entry.baseFormID].push_back(entry);
+			if (auto found = g_sources.find(SourceKey(a_path)); found != g_sources.end()) {
+				++found->second.directEntries;
+			}
 
 			// Highest priority wins; ties break on file name so the outcome does
 			// not depend on directory order.
@@ -745,10 +988,14 @@ namespace
 		const auto dir = ConfigPath();
 		std::vector<std::filesystem::path> paths;
 		if (std::filesystem::is_directory(dir, ec)) {
-			for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
-				if (entry.is_regular_file() && entry.path().extension() == ".ini") {
+			for (const auto& entry : std::filesystem::recursive_directory_iterator(
+					dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+				if (entry.is_regular_file() && Lowered(entry.path().extension().string()) == ".ini") {
 					paths.push_back(entry.path());
 				}
+			}
+			if (ec) {
+				spdlog::warn("could not inspect every entry under {}: {}", dir.string(), ec.message());
 			}
 		}
 		std::sort(paths.begin(), paths.end());
@@ -773,6 +1020,68 @@ namespace
 	bool IsChildNPC(RE::TESNPC* a_base)
 	{
 		return a_base && a_base->race && a_base->race->IsChildRace();
+	}
+
+	// Stable across load-order changes: full FormIDs include the plugin's current
+	// compile index, so hashing them would reshuffle a faction after unrelated mods
+	// are enabled. Local ID + source filename identifies the record without that.
+	std::uint32_t StableRecordHash(const RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return 0;
+		}
+		// The record identity is the stable part; the runtime seed is the explicit
+		// content-author/user knob for changing faction shares and random choices.
+		std::uint32_t h = 2166136261u ^ g_randomSeed;
+		const auto* file = a_form->GetFile(0);
+		const std::uint32_t id = file ? a_form->GetLocalFormID() : a_form->GetFormID();
+		for (int shift = 0; shift < 32; shift += 8) {
+			h ^= (id >> shift) & 0xFFu;
+			h *= 16777619u;
+		}
+		if (file) {
+			for (const unsigned char c : std::string_view(file->fileName)) {
+				h ^= static_cast<std::uint32_t>(std::tolower(c));
+				h *= 16777619u;
+			}
+		}
+		h ^= h >> 15;
+		return h;
+	}
+
+	// Stable per-record salt for faction-level randomization. The faction rule is
+	// included so that two random rules affecting the same record do not make the
+	// same choice by accident, while the result remains unchanged between runs.
+	std::uint32_t StableGroupHash(const RE::TESForm* a_form, const GroupRule& a_rule,
+		std::uint32_t a_salt)
+	{
+		std::uint32_t h = StableRecordHash(a_form) ^ a_salt;
+		auto mix = [&h](std::string_view a_text) {
+			for (const unsigned char c : a_text) {
+				h ^= static_cast<std::uint32_t>(std::tolower(c));
+				h *= 16777619u;
+			}
+		};
+		mix(a_rule.sourceFile);
+		mix(a_rule.text);
+		h ^= h >> 15;
+		h *= 2246822519u;
+		h ^= h >> 13;
+		return h;
+	}
+
+	std::vector<std::string> SortedPhysiqueNames()
+	{
+		std::vector<std::string> names;
+		names.reserve(g_physiques.size());
+		for (const auto& [key, definition] : g_physiques) {
+			static_cast<void>(key);
+			names.push_back(definition.name);
+		}
+		std::sort(names.begin(), names.end(), [](const auto& a, const auto& b) {
+			return Lowered(a) < Lowered(b);
+		});
+		return names;
 	}
 
 	// A generated table, one line per vanilla outfit:
@@ -803,7 +1112,7 @@ namespace
 		int unresolved = 0;
 		for (const auto& key : keys) {
 			const auto from = ResolveTarget(key.pItem ? key.pItem : "");
-			const auto to = ResolveTarget(ini.GetValue("Outfits", key.pItem, ""));
+			const auto to = ResolveTarget(CleanValue(ini.GetValue("Outfits", key.pItem, "")));
 			if (from == 0 || to == 0) {
 				++unresolved;
 				continue;
@@ -814,7 +1123,7 @@ namespace
 			g_outfitFamily.size(), unresolved);
 	}
 
-	// Weight, skin and outfit, applied to the base records at kDataLoaded.
+	// Auto-strength capture, skin and outfit changes, applied at kDataLoaded.
 	//
 	// This is the same thing SkyPatcher does, and deliberately at the same moment:
 	// no actor has been built yet, so nothing needs a 3D refresh and nothing pops.
@@ -829,10 +1138,23 @@ namespace
 		if (g_groups.empty()) {
 			return;
 		}
+		// Explicit [NPCs] entries always win. Between overlapping faction rules,
+		// expand the same winner policy used everywhere else first: higher priority,
+		// then lower filename. The first matching group can then claim the record.
+		std::stable_sort(g_groups.begin(), g_groups.end(), [](const auto& a, const auto& b) {
+			if (a.priority != b.priority) {
+				return a.priority > b.priority;
+			}
+			if (a.sourceFile != b.sourceFile) {
+				return a.sourceFile < b.sourceFile;
+			}
+			return a.text < b.text;
+		});
 		auto* handler = RE::TESDataHandler::GetSingleton();
 		if (!handler) {
 			return;
 		}
+		const auto physiqueNames = SortedPhysiqueNames();
 		int added = 0, skippedChildren = 0, alreadyListed = 0, notChosen = 0;
 		for (auto& rule : g_groups) {
 			rule.factionID = ResolveFaction(rule.text);
@@ -854,30 +1176,53 @@ namespace
 					++skippedChildren;
 					continue;
 				}
-				// A name written by hand always wins over a group.
-				if (g_entries.contains(npc->GetFormID())) {
-					++alreadyListed;
-					continue;
+				const bool chosen = rule.percent >= 100 ||
+					static_cast<int>(StableRecordHash(npc) % 100u) < rule.percent;
+				NpcEntry groupCandidate;
+				groupCandidate.targetText = rule.text;
+				groupCandidate.sourceFile = rule.sourceFile;
+				groupCandidate.sourcePath = rule.sourcePath;
+				groupCandidate.priority = rule.priority;
+				groupCandidate.strength = rule.strength;
+				groupCandidate.baseFormID = npc->GetFormID();
+				groupCandidate.physique = rule.physique;
+				groupCandidate.fromFaction = true;
+				if (chosen && rule.randomPhysique) {
+					if (physiqueNames.empty()) {
+						spdlog::error("faction '{}' requested random physique, but no physiques are defined",
+							rule.text);
+						continue;
+					}
+					const auto hash = StableGroupHash(npc, rule, 0x9E3779B9u);
+					groupCandidate.physique = physiqueNames[hash % physiqueNames.size()];
+				}
+				if (chosen && rule.randomStrength) {
+					const auto hash = StableGroupHash(npc, rule, 0x85EBCA6Bu);
+					groupCandidate.strength = static_cast<float>(hash % 10001u) / 100.0f;
+				}
+				if (chosen) {
+					g_entryCandidates[groupCandidate.baseFormID].push_back(groupCandidate);
+				}
+				// A valid name written by hand always wins over a group. A typo in its
+				// physique must not silently block an otherwise valid faction rule.
+				if (const auto existing = g_entries.find(npc->GetFormID());
+					existing != g_entries.end()) {
+					if (g_physiques.contains(Lowered(existing->second.physique))) {
+						++alreadyListed;
+						continue;
+					}
+					spdlog::error("{}: '{}' uses undefined physique '{}' and no longer blocks "
+						"the matching faction rule from '{}'", existing->second.sourceFile,
+						existing->second.targetText, existing->second.physique, rule.sourceFile);
+					g_entries.erase(existing);
 				}
 				// Stable share: the same records are chosen every time, because the
 				// choice comes from the form id and nothing else.
-				if (rule.percent < 100) {
-					const std::uint32_t id = npc->GetFormID();
-					std::uint32_t h = id * 2654435761u;
-					h ^= h >> 15;
-					if (static_cast<int>(h % 100u) >= rule.percent) {
-						++notChosen;
-						continue;
-					}
+				if (!chosen) {
+					++notChosen;
+					continue;
 				}
-				NpcEntry entry;
-				entry.targetText = rule.text;
-				entry.sourceFile = rule.sourceFile;
-				entry.priority = rule.priority;
-				entry.weight = rule.weight;
-				entry.baseFormID = npc->GetFormID();
-				entry.physique = rule.physique;
-				g_entries.insert_or_assign(entry.baseFormID, std::move(entry));
+				g_entries.insert_or_assign(groupCandidate.baseFormID, std::move(groupCandidate));
 				++added;
 			}
 			spdlog::info("faction '{}': {} records in it", rule.text, matched);
@@ -904,6 +1249,7 @@ namespace
 				continue;
 			}
 			it->second.physique = definition->second.name;
+			it->second.bodyMorph = definition->second.bodyMorph;
 			it->second.morphs.clear();
 			it->second.morphs.push_back({ definition->second.faceMorph, 1.0f });
 			++it;
@@ -918,24 +1264,27 @@ namespace
 		auto* skinFemale = g_skinFemaleText.empty() ? nullptr
 			: RE::TESForm::LookupByID<RE::TESObjectARMO>(ResolveTarget(g_skinFemaleText));
 
-		int weights = 0, skins = 0, outfits = 0, byFamily = 0, dressless = 0, children = 0;
+		int autoStrengths = 0, skins = 0, outfits = 0, byFamily = 0,
+			dressless = 0, children = 0;
 		for (auto& [formID, entry] : g_entries) {
 			auto* npc = RE::TESForm::LookupByID<RE::TESNPC>(formID);
 			if (!npc) {
 				continue;
 			}
 			if (IsChildNPC(npc)) {
-				spdlog::warn("'{}' (0x{:08X}) is a child and was skipped - weight, skin and "
-					"outfit were not changed", entry.targetText, formID);
+				spdlog::warn("'{}' (0x{:08X}) is a child and was skipped - skin and outfit "
+					"were not changed", entry.targetText, formID);
 				++children;
 				continue;
 			}
+			g_originalNpcRecords.try_emplace(formID,
+				OriginalNpcRecord{ npc->skin, npc->defaultOutfit });
 
-			if (entry.weight >= 0.0f) {
-				npc->weight = entry.weight;
-				++weights;
+			if (entry.strength < 0.0f) {
+				entry.strength = std::clamp(npc->weight, 0.0f, 100.0f);
+				entry.strengthFromRecord = true;
+				++autoStrengths;
 			}
-
 			auto* skin = entry.skinText.empty() ? nullptr
 				: RE::TESForm::LookupByID<RE::TESObjectARMO>(ResolveTarget(entry.skinText));
 			if (!skin) {
@@ -981,9 +1330,242 @@ namespace
 				}
 			}
 		}
-		spdlog::info("records patched: {} weights, {} skins, {} outfits ({} chosen by family), "
-			"{} left in vanilla clothes, {} children refused", weights, skins, outfits,
-			byFamily, dressless, children);
+		spdlog::info("records patched: {} strengths read from original weights, "
+			"{} skins, {} outfits ({} chosen by family), {} left in vanilla clothes, {} children "
+			"refused; NPC weights were preserved", autoStrengths, skins, outfits, byFamily,
+			dressless, children);
+	}
+
+	std::string StableFormText(const RE::TESForm* a_form)
+	{
+		if (!a_form) {
+			return {};
+		}
+		if (const auto* file = a_form->GetFile(0); file && file->fileName && *file->fileName) {
+			return std::format("0x{:08X}~{}", a_form->GetLocalFormID(), file->fileName);
+		}
+		return std::format("0x{:08X}", a_form->GetFormID());
+	}
+
+	std::string SourceDisplayName(const std::string& a_path, const std::string& a_fallback)
+	{
+		const auto found = g_sources.find(SourceKey(a_path));
+		return found == g_sources.end() ? a_fallback : found->second.name;
+	}
+
+	void PublishMenuSnapshot()
+	{
+		static std::atomic_uint64_t nextRevision{ 1 };
+		auto snapshot = std::make_shared<mpf::menu::Snapshot>();
+		snapshot->revision = nextRevision.fetch_add(1, std::memory_order_relaxed);
+		snapshot->status = g_menuStatus;
+		snapshot->buildID = MPF_BUILD_ID;
+		snapshot->backend = MPF_BODY_BACKEND;
+		snapshot->skeeAvailable = g_bodyMorphAPI != nullptr;
+		snapshot->menuApiVersion = mpf::menu::FrameworkApiVersion();
+		snapshot->loggingLevel = g_diagnostics ? 2 : (g_verbose ? 1 : 0);
+
+		for (auto& [key, source] : g_sources) {
+			source.conflictsWon = 0;
+		}
+		for (const auto& [formID, candidates] : g_entryCandidates) {
+			const auto effective = g_entries.find(formID);
+			if (effective == g_entries.end()) {
+				continue;
+			}
+			auto* npc = RE::TESForm::LookupByID<RE::TESNPC>(formID);
+			mpf::menu::NpcRow row;
+			row.formID = formID;
+			row.stableID = StableFormText(npc);
+			row.name = npc && npc->GetName() && *npc->GetName() ? npc->GetName() : effective->second.targetText;
+			row.physique = effective->second.physique;
+			row.strength = effective->second.strength;
+			row.automaticStrength = effective->second.strengthFromRecord;
+			row.sourceName = SourceDisplayName(effective->second.sourcePath,
+				effective->second.sourceFile);
+
+			for (const auto& candidate : candidates) {
+				mpf::menu::Candidate item;
+				item.sourcePath = candidate.sourcePath;
+				item.sourceName = SourceDisplayName(candidate.sourcePath, candidate.sourceFile);
+				item.targetKey = candidate.targetText;
+				item.physique = candidate.physique;
+				item.automaticStrength = candidate.strengthFromRecord || candidate.strength < 0.0f;
+				item.strength = item.automaticStrength ?
+					(npc ? std::clamp(npc->weight, 0.0f, 100.0f) : 0.0f) : candidate.strength;
+				item.priority = candidate.priority;
+				item.kind = candidate.fromFaction ? mpf::menu::OriginKind::faction :
+					mpf::menu::OriginKind::direct;
+				item.winner = candidate.sourcePath == effective->second.sourcePath &&
+					candidate.targetText == effective->second.targetText &&
+					candidate.fromFaction == effective->second.fromFaction;
+				row.candidates.push_back(std::move(item));
+			}
+			{
+				std::unordered_set<std::string> uniqueSources;
+				for (const auto& candidate : row.candidates) {
+					uniqueSources.insert(SourceKey(candidate.sourcePath));
+				}
+				row.sourceCount = uniqueSources.size();
+			}
+			std::stable_sort(row.candidates.begin(), row.candidates.end(), [](const auto& a, const auto& b) {
+				if (a.winner != b.winner) {
+					return a.winner;
+				}
+				if (a.priority != b.priority) {
+					return a.priority > b.priority;
+				}
+				return a.sourceName < b.sourceName;
+			});
+			if (row.sourceCount > 1) {
+				++snapshot->conflictCount;
+				if (auto source = g_sources.find(SourceKey(effective->second.sourcePath));
+					source != g_sources.end()) {
+					++source->second.conflictsWon;
+				}
+			}
+			snapshot->npcs.push_back(std::move(row));
+		}
+		std::sort(snapshot->npcs.begin(), snapshot->npcs.end(), [](const auto& a, const auto& b) {
+			const auto left = Lowered(a.name);
+			const auto right = Lowered(b.name);
+			return left == right ? a.formID < b.formID : left < right;
+		});
+
+		// The edited-NPC table above deliberately remains small.  The add panel,
+		// however, needs a searchable index of the whole load order so users can
+		// type a display name instead of knowing an EditorID or FormID.
+		if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+			for (auto* npc : dataHandler->GetFormArray<RE::TESNPC>()) {
+				if (!npc || IsChildNPC(npc)) {
+					continue;
+				}
+				const auto* name = npc->GetName();
+				if (!name || !*name) {
+					continue;
+				}
+				auto stableID = StableFormText(npc);
+				if (stableID.empty()) {
+					continue;
+				}
+				snapshot->npcChoices.push_back({ npc->GetFormID(), std::move(stableID), name });
+			}
+			std::sort(snapshot->npcChoices.begin(), snapshot->npcChoices.end(), [](const auto& a, const auto& b) {
+				const auto left = Lowered(a.name);
+				const auto right = Lowered(b.name);
+				return left == right ? a.formID < b.formID : left < right;
+			});
+			std::unordered_map<RE::FormID, std::string> factionAliases;
+			for (const auto& [alias, formID] : g_factionNames) {
+				factionAliases.try_emplace(formID, alias);
+			}
+			for (auto* faction : dataHandler->GetFormArray<RE::TESFaction>()) {
+				if (!faction) {
+					continue;
+				}
+				const auto* name = faction->GetName();
+				std::string displayName = name && *name ? name : "";
+				if (const auto alias = factionAliases.find(faction->GetFormID()); alias != factionAliases.end()) {
+					if (displayName.empty()) {
+						displayName = alias->second;
+					} else if (Lowered(displayName) != alias->second) {
+						displayName += std::format(" ({})", alias->second);
+					}
+				}
+				if (displayName.empty()) {
+					continue;
+				}
+				auto stableID = StableFormText(faction);
+				if (stableID.empty()) {
+					continue;
+				}
+				snapshot->factionChoices.push_back({ faction->GetFormID(), std::move(stableID), std::move(displayName) });
+			}
+			std::sort(snapshot->factionChoices.begin(), snapshot->factionChoices.end(), [](const auto& a, const auto& b) {
+				const auto left = Lowered(a.name);
+				const auto right = Lowered(b.name);
+				return left == right ? a.formID < b.formID : left < right;
+			});
+		}
+
+		for (const auto& rule : g_groups) {
+			auto* faction = RE::TESForm::LookupByID<RE::TESFaction>(rule.factionID);
+			const auto* factionName = faction ? faction->GetName() : nullptr;
+			mpf::menu::FactionRow row;
+			row.formID = rule.factionID;
+			row.stableID = StableFormText(faction);
+			row.name = factionName && *factionName ? factionName : rule.text;
+			row.targetKey = rule.text;
+			row.physique = rule.physique;
+			row.strength = rule.strength;
+			row.percent = rule.percent;
+			row.automaticStrength = rule.automaticStrength;
+			row.randomStrength = rule.randomStrength;
+			row.randomPhysique = rule.randomPhysique;
+			row.sourceName = SourceDisplayName(rule.sourcePath, rule.sourceFile);
+			row.sourcePath = rule.sourcePath;
+			row.priority = rule.priority;
+			snapshot->factions.push_back(std::move(row));
+		}
+		std::stable_sort(snapshot->factions.begin(), snapshot->factions.end(), [](const auto& a, const auto& b) {
+			if (a.priority != b.priority) {
+				return a.priority > b.priority;
+			}
+			const auto left = Lowered(a.name);
+			const auto right = Lowered(b.name);
+			return left == right ? a.sourceName < b.sourceName : left < right;
+		});
+
+		for (const auto& [key, source] : g_sources) {
+			snapshot->sources.push_back({ source.path.generic_string(), source.name, source.author,
+				source.priority, source.directEntries, source.factionRules, source.conflictsWon });
+		}
+		std::sort(snapshot->sources.begin(), snapshot->sources.end(), [](const auto& a, const auto& b) {
+			return Lowered(a.name) < Lowered(b.name);
+		});
+
+		for (const auto& [key, physique] : g_physiques) {
+			snapshot->physiques.push_back({ physique.name, physique.faceMorph, physique.bodyMorph,
+				SourceDisplayName(physique.sourcePath, physique.sourceFile), physique.priority });
+			snapshot->physiqueNames.push_back(physique.name);
+		}
+		std::sort(snapshot->physiques.begin(), snapshot->physiques.end(), [](const auto& a, const auto& b) {
+			return Lowered(a.name) < Lowered(b.name);
+		});
+		std::sort(snapshot->physiqueNames.begin(), snapshot->physiqueNames.end(), [](const auto& a, const auto& b) {
+			return Lowered(a) < Lowered(b);
+		});
+		mpf::menu::Publish(std::move(snapshot));
+	}
+
+	void RestoreOriginalRecords()
+	{
+		for (const auto& [formID, original] : g_originalNpcRecords) {
+			if (auto* npc = RE::TESForm::LookupByID<RE::TESNPC>(formID)) {
+				npc->skin = original.skin;
+				if (original.outfit) {
+					npc->SetDefaultOutfit(original.outfit);
+				} else {
+					npc->defaultOutfit = nullptr;
+				}
+			}
+		}
+	}
+
+	void ClearConfigState()
+	{
+		g_entries.clear();
+		g_entryCandidates.clear();
+		g_sources.clear();
+		g_physiques.clear();
+		g_groups.clear();
+		g_skinMaleText.clear();
+		g_skinFemaleText.clear();
+		g_skinMalePriority = (std::numeric_limits<int>::min)();
+		g_skinFemalePriority = (std::numeric_limits<int>::min)();
+		g_skinMaleSource.clear();
+		g_skinFemaleSource.clear();
+		LoadRuntimeSettings();
 	}
 
 	// -----------------------------------------------------------------------
@@ -1204,7 +1786,6 @@ namespace
 		const bool sweeping = std::string_view(a_tag) == "sweep";
 		auto*      base = a_actor->GetActorBase();
 		const bool female = base && base->GetSex() == RE::SEX::kFemale;
-		const float npcWeight = base ? base->weight : 100.0f;
 		bool       reportedParts = false;
 
 		auto* faceNode = a_actor->GetFaceNodeSkinned();
@@ -1237,6 +1818,10 @@ namespace
 			if (!a_dryRun) {
 				const auto seen = g_applied.find(fod->vertexData);
 				if (seen != g_applied.end() && seen->second == Fingerprint(fod->vertexData, vcount)) {
+					if (!sweeping) {
+						spdlog::info("[{}] '{}' already contains the MPF face delta; skipped buffer {}",
+							a_tag, geom->name.c_str(), static_cast<const void*>(fod->vertexData));
+					}
 					return;
 				}
 			}
@@ -1284,17 +1869,10 @@ namespace
 						a_tag, request.name, female ? "female" : "male", vcount);
 					continue;
 				}
-				// The face rides the same axis as the body: an NPC at weight 100
-				// gets the declared strength, one at weight 0 gets none. That is
-				// what keeps a heavy face on a heavy body without anyone having
-				// to author a number per NPC.
-				// The list's weight is the strength, one to one; "auto" falls back
-				// to whatever the record says, for setups that drive weight
-				// elsewhere.
-				const float listedWeight = a_entry.weight < 0.0f ? npcWeight : a_entry.weight;
-				const float effective = listedWeight / 100.0f;
+				// Face and body morphs share one percentage. Engine weight is preserved.
+				const float effective = (a_entry.strength / 100.0f) * request.scale;
 				if (effective == 0.0f) {
-					spdlog::info("[{}] '{}' '{}' is at weight 0, nothing to apply",
+					spdlog::info("[{}] '{}' '{}' is at strength 0, nothing to apply",
 						a_tag, geom->name.c_str(), request.name);
 					continue;
 				}
@@ -1311,10 +1889,12 @@ namespace
 				// The buffer address is logged because a shared head between two
 				// references of the same base NPC shows up here as the same
 				// address twice, and nothing else in the log would reveal it.
-				spdlog::info("[{}] '{}' {} '{}' x{:.3f} (weight {:.1f} from the {}) over {} verts "
+				spdlog::info("[{}] '{}' {} '{}' x{:.3f} (strength {:.1f} from the {}) over {} verts "
 							 "from '{}' (mesh distance {:.3f}), maxMove={:.4f}, buffer {}",
 					a_tag, geom->name.c_str(), a_dryRun ? "would apply" : "applied",
-					request.name, effective, listedWeight, a_entry.weight < 0.0f ? "record" : "list", vcount, set->file, distance, maxMove,
+					request.name, effective, a_entry.strength,
+					a_entry.strengthFromRecord ? "original record" : "list", vcount,
+					set->file, distance, maxMove,
 					static_cast<const void*>(fod->vertexData));
 				++stats.geometriesTouched;
 			}
@@ -1387,78 +1967,339 @@ namespace
 		return ListedThroughTemplate(a_actor->GetActorBase());
 	}
 
-	bool OnList(RE::Actor* a_actor) { return ListedBase(a_actor) != nullptr; }
-
-	std::optional<std::string> PickOBodyPreset(const NpcEntry& a_entry, bool a_female)
+	bool HasBodyMorphMappings()
 	{
-		const auto definition = g_physiques.find(Lowered(a_entry.physique));
-		if (definition == g_physiques.end()) {
-			return std::nullopt;
-		}
-		const auto& presets = a_female ? definition->second.femalePresets : definition->second.malePresets;
-		if (presets.empty()) {
-			return std::nullopt;
-		}
-
-		// Same avalanche used by faction percentages: cheap, stable, and based on
-		// the listed base rather than the transient spawned reference.
-		std::uint32_t h = a_entry.baseFormID * 2654435761u;
-		h ^= h >> 15;
-		return presets[h % presets.size()];
-	}
-
-	bool HasOBodyPresetMappings()
-	{
-		return std::ranges::any_of(g_physiques, [](const auto& item) {
-			return !item.second.malePresets.empty() || !item.second.femalePresets.empty();
+		return std::ranges::any_of(g_entries, [](const auto& item) {
+			return !item.second.bodyMorph.empty();
 		});
 	}
 
-	void SyncOBodyPreset(RE::Actor* a_actor, const NpcEntry& a_entry, const char* a_tag)
+	void VisitObjects(RE::NiAVObject* a_obj, const std::function<void(RE::NiAVObject*)>& a_fn)
 	{
-		if (!a_actor || !g_obodyReady.load(std::memory_order_acquire) || !g_obodyAPI) {
+		if (!a_obj) {
 			return;
 		}
-
-		const auto referenceID = a_actor->GetFormID();
-		if (g_obodySynced.contains(referenceID) || g_obodyFailed.contains(referenceID)) {
-			return;
-		}
-
-		const auto* actorBase = a_actor->GetActorBase();
-		const bool female = actorBase && actorBase->GetSex() == RE::SEX::kFemale;
-		const auto desired = PickOBodyPreset(a_entry, female);
-		if (!desired) {
-			// Empty pools are valid for the standalone build and for face-only
-			// physiques. OBody simply keeps control of body distribution.
-			return;
-		}
-
-		OBody::API::PresetAssignmentInformation current{};
-		g_obodyAPI->GetPresetAssignedToActor(a_actor, current);
-		if (current.presetName == *desired) {
-			g_obodySynced.insert_or_assign(referenceID, *desired);
-			if (g_diagnostics) {
-				spdlog::info("[{}] '{}' already has OBody preset '{}'", a_tag,
-					a_actor->GetName(), *desired);
+		a_fn(a_obj);
+		if (auto* node = a_obj->AsNode()) {
+			for (auto& child : node->GetChildren()) {
+				VisitObjects(child.get(), a_fn);
 			}
-			return;
-		}
-
-		OBody::API::AssignPresetPayload payload{};
-		payload.presetName = *desired;
-		if (g_obodyAPI->AssignPresetToActor(a_actor, payload)) {
-			g_obodySynced.insert_or_assign(referenceID, *desired);
-			spdlog::info("[{}] '{}' ref=0x{:08X} -> OBody preset '{}'", a_tag,
-				a_actor->GetName(), referenceID, *desired);
-		} else {
-			g_obodyFailed.insert(referenceID);
-			spdlog::error("[{}] '{}' could not receive OBody preset '{}' - check the internal "
-				"name in the BodySlide XML", a_tag, a_actor->GetName(), *desired);
 		}
 	}
 
-	void ScheduleOBodySyncForLoadedActors(bool a_reset)
+	class BodyMorphLogVisitor final : public SKEE::IBodyMorphInterface::MorphValueVisitor
+	{
+	public:
+		BodyMorphLogVisitor(const char* a_tag, const char* a_phase) :
+			tag(a_tag), phase(a_phase)
+		{}
+
+		void Visit(RE::TESObjectREFR*, const char* a_morph, const char* a_key,
+			float a_value) override
+		{
+			if (std::abs(a_value) <= 0.0001f) {
+				return;
+			}
+			++count;
+			spdlog::info("[{}] body-state {}: morph '{}' key '{}' x{:.3f}", tag,
+				phase, a_morph ? a_morph : "<null>", a_key ? a_key : "<null>",
+				a_value);
+		}
+
+		std::size_t count{ 0 };
+
+	private:
+		const char* tag;
+		const char* phase;
+	};
+
+	void LogBodyMorphState(RE::Actor* a_actor, const char* a_tag, const char* a_phase)
+	{
+		if (!a_actor || !g_bodyMorphAPI) {
+			return;
+		}
+		BodyMorphLogVisitor visitor(a_tag, a_phase);
+		g_bodyMorphAPI->VisitMorphValues(a_actor, visitor);
+		if (visitor.count == 0) {
+			spdlog::info("[{}] body-state {}: no active RaceMenu morph values", a_tag,
+				a_phase);
+		}
+	}
+
+	std::optional<std::filesystem::path> ResolveLiveBodyTri(std::string a_value,
+		std::string& a_error)
+	{
+		a_error.clear();
+		Trim(a_value);
+		if (a_value.empty()) {
+			a_error = "empty BODYTRI value";
+			return std::nullopt;
+		}
+
+		std::filesystem::path relative(a_value);
+		const bool escapesMeshes = relative.is_absolute() || relative.has_root_path() ||
+			std::ranges::any_of(relative, [](const auto& component) { return component == ".."; });
+		if (escapesMeshes) {
+			a_error = "BODYTRI is not a relative meshes path";
+			return std::nullopt;
+		}
+		relative = relative.lexically_normal();
+
+		std::filesystem::path path("Data");
+		auto first = relative.begin();
+		if (first != relative.end() && Lowered(first->string()) == "meshes") {
+			path /= relative;
+		} else {
+			path /= "meshes";
+			path /= relative;
+		}
+		return path.lexically_normal();
+	}
+
+	std::string JoinShapeNames(const std::vector<std::string>& a_names)
+	{
+		constexpr std::size_t kMaxNames = 8;
+		std::string result;
+		for (std::size_t i = 0; i < a_names.size() && i < kMaxNames; ++i) {
+			result += std::format("{}'{}'", result.empty() ? "" : ", ", a_names[i]);
+		}
+		if (a_names.size() > kMaxNames) {
+			result += std::format(", and {} more", a_names.size() - kMaxNames);
+		}
+		return result;
+	}
+
+	void ReportBodyDiagnostics(RE::Actor* a_actor, const NpcEntry& a_entry, const char* a_tag)
+	{
+		if (!a_actor) {
+			return;
+		}
+
+		const float expected = std::clamp(a_entry.strength / 100.0f, 0.0f, 1.0f);
+		const auto* runtimeBase = a_actor->GetActorBase();
+		spdlog::info("[{}] body diagnostic: physique='{}' strength={:.1f} ({}) "
+			"engineWeight={:.1f} morph='{}' expected=x{:.3f}",
+			a_tag, a_entry.physique, a_entry.strength,
+			a_entry.strengthFromRecord ? "original record" : "list",
+			runtimeBase ? runtimeBase->weight : -1.0f,
+			a_entry.bodyMorph.empty() ? "<face-only>" : a_entry.bodyMorph, expected);
+
+		if (a_entry.bodyMorph.empty()) {
+			spdlog::info("[{}] body diagnostic result: face-only physique; no body asset check needed",
+				a_tag);
+			return;
+		}
+
+		if (!g_bodyMorphAPI) {
+			spdlog::warn("[{}] body diagnostic result: RaceMenu/SKEE BodyMorph interface is unavailable",
+				a_tag);
+		} else {
+			const bool hasPair = g_bodyMorphAPI->HasBodyMorph(a_actor,
+				a_entry.bodyMorph.c_str(), kBodyMorphKey.data());
+			const bool hasName = g_bodyMorphAPI->HasBodyMorphName(a_actor,
+				a_entry.bodyMorph.c_str());
+			const bool hasKey = g_bodyMorphAPI->HasBodyMorphKey(a_actor, kBodyMorphKey.data());
+			const float owned = g_bodyMorphAPI->GetMorph(a_actor,
+				a_entry.bodyMorph.c_str(), kBodyMorphKey.data());
+			const float combined = g_bodyMorphAPI->GetBodyMorphs(a_actor,
+				a_entry.bodyMorph.c_str());
+			spdlog::info("[{}] SKEE state: MPF pair={} MPF key={} morph name={} "
+				"owned=x{:.3f} combined-all-keys=x{:.3f} submitted-this-3D={}",
+				a_tag, hasPair ? "yes" : "no", hasKey ? "yes" : "no",
+				hasName ? "yes" : "no", owned, combined,
+				g_bodyApplied.contains(a_actor->GetFormID()) ? "yes" : "no");
+			if (expected > 0.0001f && (!hasPair || std::abs(owned - expected) > 0.001f)) {
+				spdlog::warn("[{}] SKEE state mismatch: expected MPF '{}' x{:.3f}, stored x{:.3f}",
+					a_tag, a_entry.bodyMorph, expected, owned);
+			}
+		}
+
+		std::vector<std::string> wornBodyPieces;
+		for (const auto& [item, data] : a_actor->GetInventory([](RE::TESBoundObject& a_object) {
+				 return a_object.IsArmor();
+			 })) {
+			auto* armor = item->As<RE::TESObjectARMO>();
+			if (!armor || data.first <= 0 || !data.second || !data.second->IsWorn() ||
+				!armor->bipedModelData.bipedObjectSlots.any(
+					RE::BIPED_MODEL::BipedObjectSlot::kBody)) {
+				continue;
+			}
+			const auto* armorName = armor->GetName();
+			wornBodyPieces.push_back(std::format("0x{:08X} '{}'", armor->GetFormID(),
+				armorName && *armorName ? armorName : "<unnamed>"));
+		}
+		spdlog::info("[{}] worn slot-32 pieces: {}{}", a_tag, wornBodyPieces.size(),
+			wornBodyPieces.empty() ? "" : std::format(" ({})", JoinShapeNames(wornBodyPieces)));
+
+		std::unordered_set<std::string> bodyTriValues;
+		std::size_t geometryCount = 0;
+		std::size_t shapeDataCount = 0;
+		static const RE::BSFixedString bodyTriKey{ "BODYTRI" };
+		static const RE::BSFixedString shapeDataKey{ "SHAPEDATA" };
+		VisitObjects(a_actor->Get3D(false), [&](RE::NiAVObject* a_object) {
+			if (auto* bodyTri = a_object->GetExtraData<RE::NiStringExtraData>(bodyTriKey);
+				bodyTri && bodyTri->value && *bodyTri->value) {
+				bodyTriValues.insert(bodyTri->value);
+			}
+			if (auto* geometry = a_object->AsGeometry()) {
+				++geometryCount;
+				if (geometry->GetExtraData(shapeDataKey)) {
+					++shapeDataCount;
+				}
+			}
+		});
+		spdlog::info("[{}] live 3D: geometries={} BODYTRI assets={} SHAPEDATA geometries={}",
+			a_tag, geometryCount, bodyTriValues.size(), shapeDataCount);
+
+		if (bodyTriValues.empty()) {
+			spdlog::warn("[{}] body diagnostic result: live body/outfit exposes no BODYTRI; "
+				"RaceMenu has no compatible morph asset to inspect", a_tag);
+			return;
+		}
+
+		bool anyAssetContainsMorph = false;
+		for (const auto& bodyTriValue : bodyTriValues) {
+			std::string pathError;
+			const auto path = ResolveLiveBodyTri(bodyTriValue, pathError);
+			if (!path) {
+				spdlog::warn("[{}] BODYTRI '{}' refused: {}", a_tag, bodyTriValue, pathError);
+				continue;
+			}
+			const auto cacheKey = Lowered(path->generic_string());
+			auto [cached, inserted] = g_bodyTriDiagnostics.try_emplace(cacheKey);
+			if (inserted) {
+				cached->second.loaded = cached->second.index.Load(*path, cached->second.error);
+			}
+
+			if (!cached->second.loaded) {
+				spdlog::warn("[{}] BODYTRI '{}' could not be indexed: {}", a_tag,
+					path->generic_string(), cached->second.error);
+				continue;
+			}
+
+			const auto& shapes = cached->second.index.Shapes();
+			const auto withMorph = cached->second.index.CountShapesWith(a_entry.bodyMorph);
+			anyAssetContainsMorph = anyAssetContainsMorph || withMorph > 0;
+			std::vector<std::string> missing;
+			for (const auto& shape : shapes) {
+				if (!shape.morphs.contains(a_entry.bodyMorph)) {
+					missing.push_back(shape.name);
+				}
+			}
+
+			if (withMorph == 0) {
+				spdlog::warn("[{}] BODYTRI '{}' has morph '{}' on 0/{} shapes",
+					a_tag, path->generic_string(), a_entry.bodyMorph, shapes.size());
+			} else {
+				spdlog::info("[{}] BODYTRI '{}' has morph '{}' on {}/{} shapes{}",
+					a_tag, path->generic_string(), a_entry.bodyMorph, withMorph, shapes.size(),
+					missing.empty() ? "" : std::format("; missing: {}", JoinShapeNames(missing)));
+			}
+		}
+
+		if (!anyAssetContainsMorph) {
+			spdlog::warn("[{}] body diagnostic result: '{}' is stored on the actor but absent "
+				"from every readable live BODYTRI", a_tag, a_entry.bodyMorph);
+		} else {
+			spdlog::info("[{}] body diagnostic result: at least one live BODYTRI contains '{}'",
+				a_tag, a_entry.bodyMorph);
+		}
+	}
+
+	bool ClearOwnedBodyMorph(RE::Actor* a_actor, const char* a_tag)
+	{
+		if (!a_actor) {
+			return false;
+		}
+		const auto referenceID = a_actor->GetFormID();
+		const bool tracked = g_bodyApplied.erase(referenceID) != 0;
+		const bool hasKey = g_bodyMorphAPI &&
+			g_bodyMorphAPI->HasBodyMorphKey(a_actor, kBodyMorphKey.data());
+		if (!hasKey) {
+			return tracked;
+		}
+		g_bodyMorphAPI->ClearBodyMorphKeys(a_actor, kBodyMorphKey.data());
+		g_bodyMorphAPI->ApplyBodyMorphs(a_actor, true);
+		spdlog::info("[{}] '{}' ref=0x{:08X} cleared stale body morph key '{}'",
+			a_tag, a_actor->GetName(), referenceID, kBodyMorphKey);
+		return true;
+	}
+
+	void ApplyBodyMorph(RE::Actor* a_actor, const NpcEntry& a_entry, const char* a_tag,
+		bool a_dryRun)
+	{
+		if (!a_actor) {
+			return;
+		}
+
+		const float relative = std::clamp(a_entry.strength / 100.0f, 0.0f, 1.0f);
+		const auto referenceID = a_actor->GetFormID();
+		const auto generation = g_loadGeneration.load(std::memory_order_acquire);
+		if (const auto state = g_bodyApplied.find(referenceID); state != g_bodyApplied.end() &&
+			state->second.baseFormID == a_entry.baseFormID &&
+			state->second.morph == a_entry.bodyMorph &&
+			std::abs(state->second.strength - relative) <= 0.0001f &&
+			state->second.generation == generation) {
+			return;
+		}
+		if (a_dryRun) {
+			ReportBodyDiagnostics(a_actor, a_entry, a_tag);
+			return;
+		}
+		if (!g_bodyMorphAPI) {
+			return;
+		}
+		if (a_entry.bodyMorph.empty()) {
+			ClearOwnedBodyMorph(a_actor, a_tag);
+			g_bodyApplied[referenceID] = BodyApplyState{
+				a_entry.baseFormID, {}, relative, true, generation };
+			return;
+		}
+
+		// Validate while the current RaceMenu state is still visible. Clearing the
+		// MPF key first would make HasBodyMorph/HasBodyMorphName report false for a
+		// morph that was already known to this actor, turning a valid reapplication
+		// into a false compatibility failure.
+		const bool hasMorph = g_bodyMorphAPI->HasBodyMorph(
+			a_actor, a_entry.bodyMorph.c_str(), kBodyMorphKey.data()) ||
+			g_bodyMorphAPI->HasBodyMorphName(a_actor, a_entry.bodyMorph.c_str());
+		// MPF owns only its own key. Other RaceMenu morph consumers are never
+		// inspected or modified. ApplyBodyMorphs rebuilds each shape from RaceMenu's
+		// saved SHAPEDATA before evaluating all active keys, so there is no cumulative
+		// deformation. Clear our old target before every target change so a reload or
+		// an edited INI cannot leave two MPF values active at once.
+		LogBodyMorphState(a_actor, a_tag, "before MPF update");
+		g_bodyMorphAPI->ClearBodyMorphKeys(a_actor, kBodyMorphKey.data());
+		if (!hasMorph) {
+			// A missing body TRI/morph is a compatibility failure, not a reason to
+			// call SetMorph with an invented name. The cleared key removes stale MPF
+			// data while leaving other body-morph owners untouched.
+			g_bodyMorphAPI->ApplyBodyMorphs(a_actor, true);
+			g_bodyApplied[referenceID] = BodyApplyState{
+				a_entry.baseFormID, a_entry.bodyMorph, relative, false, generation };
+			spdlog::warn("[{}] '{}' ref=0x{:08X} body morph '{}' is unavailable on the "
+				"current body/outfit; MPF body application skipped",
+				a_tag, a_actor->GetName(), referenceID, a_entry.bodyMorph);
+			return;
+		}
+		if (relative > 0.0f) {
+			g_bodyMorphAPI->SetMorph(a_actor, a_entry.bodyMorph.c_str(),
+				kBodyMorphKey.data(), relative);
+		}
+		LogBodyMorphState(a_actor, a_tag, "after MPF update");
+		g_bodyMorphAPI->ApplyBodyMorphs(a_actor, true);
+		g_bodyApplied[referenceID] = BodyApplyState{
+			a_entry.baseFormID, a_entry.bodyMorph, relative, true, generation };
+		const auto* runtimeBase = a_actor->GetActorBase();
+		spdlog::info("[{}] '{}' ref=0x{:08X} preserved weight {:.1f}; body morph '{}' "
+			"x{:.3f} under key '{}'", a_tag, a_actor->GetName(), referenceID,
+			runtimeBase ? runtimeBase->weight : -1.0f, a_entry.bodyMorph, relative,
+			kBodyMorphKey);
+	}
+
+	void QueueForHead(RE::Actor* a_actor, bool a_resetBody = true);
+
+	void ScheduleBodyMorphsForLoadedActors(bool a_reset)
 	{
 		auto* tasks = SKSE::GetTaskInterface();
 		if (!tasks) {
@@ -1466,11 +2307,9 @@ namespace
 		}
 		tasks->AddTask([a_reset]() {
 			if (a_reset) {
-				g_obodySynced.clear();
-				g_obodyFailed.clear();
+				g_bodyApplied.clear();
 			}
-			if (!g_dataLoaded.load(std::memory_order_acquire) ||
-				!g_obodyReady.load(std::memory_order_acquire) || !g_obodyAPI) {
+			if (!g_dataLoaded.load(std::memory_order_acquire) || !g_bodyMorphAPI) {
 				return;
 			}
 			auto* lists = RE::ProcessLists::GetSingleton();
@@ -1484,10 +2323,13 @@ namespace
 				}
 				auto* listed = ListedBase(actor.get());
 				if (!listed) {
+					ClearOwnedBodyMorph(actor.get(), "body-ready");
 					continue;
 				}
 				if (const auto entry = g_entries.find(listed->GetFormID()); entry != g_entries.end()) {
-					SyncOBodyPreset(actor.get(), entry->second, "obody-ready");
+					QueueForHead(actor.get());
+				} else {
+					ClearOwnedBodyMorph(actor.get(), "body-ready");
 				}
 			}
 		});
@@ -1508,15 +2350,21 @@ namespace
 			base = listed;
 		}
 		if (IsChildNPC(base)) {
-			if (g_diagnostics) {
+			if (!a_dryRun) {
+				ClearOwnedBodyMorph(a_actor, a_tag);
+			}
+			if (a_dryRun || g_diagnostics) {
 				spdlog::info("[{}] '{}' base=0x{:08X} is a child - refused", a_tag,
-					a_actor->GetName(), base->GetFormID());
+					 a_actor->GetName(), base->GetFormID());
 			}
 			return stats;
 		}
 		const auto it = g_entries.find(base->GetFormID());
 		if (it == g_entries.end()) {
-			if (g_verbose) {
+			if (!a_dryRun) {
+				ClearOwnedBodyMorph(a_actor, a_tag);
+			}
+			if (a_dryRun || g_verbose) {
 				spdlog::info("[{}] '{}' base=0x{:08X} is not on the list", a_tag, a_actor->GetName(), base->GetFormID());
 			}
 			return stats;
@@ -1534,13 +2382,7 @@ namespace
 				base->GetFormID(), it->second.sourceFile);
 		}
 
-		if (!a_dryRun) {
-			SyncOBodyPreset(a_actor, it->second, a_tag);
-		} else if (const auto preset = PickOBodyPreset(it->second,
-			base->GetSex() == RE::SEX::kFemale)) {
-			spdlog::info("[{}] '{}' would receive OBody preset '{}'", a_tag,
-				a_actor->GetName(), *preset);
-		}
+		ApplyBodyMorph(a_actor, it->second, a_tag, a_dryRun);
 		// Dress the actor itself, once. The base record was patched at
 		// kDataLoaded, which settles anybody the game builds afterwards; an actor
 		// the save already contained needs telling directly.
@@ -1550,8 +2392,8 @@ namespace
 				g_dressed.insert(a_actor->GetFormID());
 
 				// "The body looks past 100%" has been reported three times, and the
-				// files rule out the obvious causes: the weight is 100, which is the
-				// maximum; nothing but heads, beards and brows receives a morph; and
+				// files rule out the obvious causes: body morph strength is clamped to
+				// 100%; nothing but heads, beards and brows receives a face morph; and
 				// the body baked into each outfit matches the one the skin applies to
 				// within 2%. What no file can show is a second torso equipped on top
 				// of the first, which would thicken the silhouette without anything
@@ -1633,58 +2475,6 @@ namespace
 	// -----------------------------------------------------------------------
 	// events
 	// -----------------------------------------------------------------------
-	class LoadSink : public RE::BSTEventSink<RE::TESObjectLoadedEvent>
-	{
-	public:
-		static LoadSink* GetSingleton()
-		{
-			static LoadSink s;
-			return &s;
-		}
-
-		RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* a_event,
-			RE::BSTEventSource<RE::TESObjectLoadedEvent>*) override
-		{
-			if (!a_event) {
-				return RE::BSEventNotifyControl::kContinue;
-			}
-			auto* form = RE::TESForm::LookupByID(a_event->formID);
-			auto* actor = form ? form->As<RE::Actor>() : nullptr;
-			auto* base = actor ? actor->GetActorBase() : nullptr;
-
-			// Every event, unconditionally, when diagnostics are on. Two NPCs
-			// appeared in neither the applied nor the unmatched list last time,
-			// which the earlier logging could not distinguish from the event
-			// never arriving - so now nothing is filtered before it is recorded.
-			if (g_diagnostics) {
-				spdlog::info("[event] ref=0x{:08X} loaded={} form={} actor={} base={} name='{}'",
-					a_event->formID, a_event->loaded ? 1 : 0,
-					form ? "yes" : "NULL", actor ? "yes" : "NULL",
-					base ? std::format("0x{:08X}", base->GetFormID()) : std::string("NULL"),
-					actor ? actor->GetName() : "");
-			}
-
-			if (!base || !OnList(actor)) {
-				return RE::BSEventNotifyControl::kContinue;
-			}
-			if (!a_event->loaded) {
-				// Deliberately NOT forgetting the buffers this actor used. A
-				// recycled address is already handled by the fingerprint, while
-				// forgetting would let a head shared between two references of
-				// the same base NPC take the morph twice.
-				return RE::BSEventNotifyControl::kContinue;
-			}
-			// The head is not built yet when this fires, so apply a beat later.
-			SKSE::GetTaskInterface()->AddTask([formID = actor->GetFormID()]() {
-				auto* f = RE::TESForm::LookupByID(formID);
-				if (auto* a = f ? f->As<RE::Actor>() : nullptr) {
-					HandleActor(a, "3d-loaded", false);
-				}
-			});
-			return RE::BSEventNotifyControl::kContinue;
-		}
-	};
-
 	class InputSink : public RE::BSTEventSink<RE::InputEvent*>
 	{
 	public:
@@ -1702,11 +2492,29 @@ namespace
 			}
 			for (auto* e = *a_event; e; e = e->next) {
 				auto* button = e->AsButtonEvent();
-				if (!button || !button->IsDown()) {
+				if (!button) {
 					continue;
 				}
 				const auto code = button->GetIDCode();
+				if (button->device == RE::INPUT_DEVICE::kKeyboard &&
+					code == RE::BSKeyboardDevice::Key::kLeftShift) {
+					_leftShiftDown = button->IsPressed();
+					continue;
+				}
+				if (button->device == RE::INPUT_DEVICE::kKeyboard &&
+					code == RE::BSKeyboardDevice::Key::kRightShift) {
+					_rightShiftDown = button->IsPressed();
+					continue;
+				}
+				if (!button->IsDown()) {
+					continue;
+				}
 				if (code != kKeyReport && code != kKeyApply) {
+					continue;
+				}
+				if (code == kKeyReport &&
+					(button->device != RE::INPUT_DEVICE::kKeyboard ||
+						(!_leftShiftDown && !_rightShiftDown))) {
 					continue;
 				}
 				auto* actor = NearestActor();
@@ -1714,21 +2522,22 @@ namespace
 					spdlog::warn("no actor nearby");
 					continue;
 				}
-				HandleActor(actor, code == kKeyReport ? "F7-report" : "F8-apply", code == kKeyReport);
+				HandleActor(actor, code == kKeyReport ? "Shift+F7-report" : "F6-apply", code == kKeyReport);
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
+
+	private:
+		bool _leftShiftDown{ false };
+		bool _rightShiftDown{ false };
 	};
 
-	// The 3D-load event is not dependable: measured on a nine-NPC spawn, only
-	// sixteen events arrived at all and two of the NPCs produced none, while
-	// their bodies were visibly patched by other means. So the event is kept as
 	// Where the morph is applied from, and why it is a hook rather than a listener.
 	//
 	// The face lives in a vertex buffer we write into, and that write does not
 	// survive the head being rebuilt - so the question is not "has this NPC appeared
-	// in this save", the way OBody asks (its morphs are stored by SKEE and reapplied
-	// for it), but "has this head just been built", every time. Character::Load3D is
+	// in this save" (body morph values are stored by SKEE), but "has this head just
+	// been built", every time. Character::Load3D is
 	// the game's own answer: it is the call that builds an actor's 3D, so it runs on
 	// the engine's code path rather than as a notification the engine may not send.
 	//
@@ -1753,12 +2562,19 @@ namespace
 	struct Pending
 	{
 		RE::ActorHandle handle;
+		RE::FormID      referenceID{ 0 };
 		int             attempts{ 0 };
+		bool            resetBody{ true };
+		std::uint64_t   generation{ 0 };
 	};
 
 	std::mutex               g_pendingLock;
 	std::condition_variable  g_pendingCv;
-	std::vector<Pending>     g_pending;
+	// One pending item per reference. Load3D can fire more than once while a
+	// head is being attached; keeping a vector here used to schedule duplicate
+	// retries for the same actor and made the body reset/apply race harder to
+	// reason about.
+	std::unordered_map<RE::FormID, Pending> g_pending;
 	std::atomic_bool         g_waiterRunning{ false };
 
 	constexpr int kMaxHeadWaitTries = 20;      // 20 x 250ms = five seconds, then give up
@@ -1775,19 +2591,41 @@ namespace
 				{
 					std::unique_lock lock(g_pendingLock);
 					g_pendingCv.wait(lock, [] { return !g_pending.empty(); });
-					batch.swap(g_pending);
+					batch.reserve(g_pending.size());
+					for (auto& [referenceID, item] : g_pending) {
+						static_cast<void>(referenceID);
+						batch.push_back(std::move(item));
+					}
+					g_pending.clear();
 				}
 				std::this_thread::sleep_for(kHeadWaitStep);
 				auto* task = SKSE::GetTaskInterface();
 				if (!task) {
+					std::lock_guard lock(g_pendingLock);
+					for (auto& item : batch) {
+						auto& slot = g_pending[item.referenceID];
+						if (slot.referenceID == 0 || item.generation >= slot.generation) {
+							slot = std::move(item);
+						} else {
+							slot.resetBody = slot.resetBody || item.resetBody;
+						}
+					}
+					g_pendingCv.notify_one();
 					continue;
 				}
 				task->AddTask([batch]() mutable {
 					std::vector<Pending> again;
 					for (auto& item : batch) {
+						if (item.generation != g_loadGeneration.load(std::memory_order_acquire)) {
+							continue;
+						}
 						auto actor = item.handle.get();
 						if (!actor) {
 							continue;
+						}
+						if (item.resetBody) {
+							g_bodyApplied.erase(actor->GetFormID());
+							item.resetBody = false;
 						}
 						const auto stats = HandleActor(actor.get(), "3d", false);
 						if (!stats.noFaceNode) {
@@ -1802,7 +2640,14 @@ namespace
 					}
 					if (!again.empty()) {
 						std::lock_guard lock(g_pendingLock);
-						g_pending.insert(g_pending.end(), again.begin(), again.end());
+						for (auto& item : again) {
+							auto& slot = g_pending[item.referenceID];
+							if (slot.referenceID == 0 || item.generation >= slot.generation) {
+								slot = std::move(item);
+							} else {
+								slot.resetBody = slot.resetBody || item.resetBody;
+							}
+						}
 						g_pendingCv.notify_one();
 					}
 				});
@@ -1810,13 +2655,46 @@ namespace
 		}).detach();
 	}
 
-	void QueueForHead(RE::Actor* a_actor)
+	void QueueForHead(RE::Actor* a_actor, bool a_resetBody)
 	{
+		if (!a_actor) {
+			return;
+		}
+		const auto referenceID = a_actor->GetFormID();
 		{
 			std::lock_guard lock(g_pendingLock);
-			g_pending.push_back({ a_actor->CreateRefHandle(), 0 });
+			auto& item = g_pending[referenceID];
+			if (item.referenceID == 0) {
+				item = Pending{
+					a_actor->CreateRefHandle(), referenceID, 0, a_resetBody,
+					g_loadGeneration.load(std::memory_order_acquire) };
+			} else {
+				item.handle = a_actor->CreateRefHandle();
+				item.resetBody = item.resetBody || a_resetBody;
+				item.generation = g_loadGeneration.load(std::memory_order_acquire);
+				item.attempts = 0;
+			}
 		}
 		g_pendingCv.notify_one();
+	}
+
+	void QueueLoadedActorsForHeads()
+	{
+		auto* tasks = SKSE::GetTaskInterface();
+		if (!tasks) {
+			return;
+		}
+		tasks->AddTask([]() {
+			auto* lists = RE::ProcessLists::GetSingleton();
+			if (!lists) {
+				return;
+			}
+			for (auto& handle : lists->highActorHandles) {
+				if (auto actor = handle.get()) {
+					QueueForHead(actor.get());
+				}
+			}
+		});
 	}
 
 	struct Load3DHook
@@ -1824,16 +2702,13 @@ namespace
 		static RE::NiAVObject* thunk(RE::TESObjectREFR* a_this, bool a_background)
 		{
 			auto* result = func(a_this, a_background);
-			if (g_entries.empty()) {
-				return result;
-			}
 			auto* actor = a_this ? a_this->As<RE::Actor>() : nullptr;
-			// A base the game invented at runtime does not carry its origin yet at
-			// this point, so ListedBase can answer "no" for somebody who is on the
-			// list. Those are queued anyway and the queue asks again once the head
-			// is up - it is how Skjorni was reachable at all.
-			if (actor && (OnList(actor) || (actor->GetActorBase() &&
-					(actor->GetActorBase()->GetFormID() >> 24) == 0xFF))) {
+			// Queue every actor. This is a one-shot check per 3D build, not polling,
+			// and it is necessary to remove an MPF key persisted in the RaceMenu
+			// co-save after its NPC was deleted from the INI. It also avoids calling
+			// the SKEE interface from a background Load3D invocation. Listed actors
+			// whose bases were invented at runtime are resolved once the task runs.
+			if (actor) {
 				QueueForHead(actor);
 			}
 			return result;
@@ -1850,42 +2725,323 @@ namespace
 			"with no polling at rest");
 	}
 
-	class OBodyReadinessListener final : public OBody::API::IOBodyReadinessEventListener
+	void RequestBodyMorphAPI()
 	{
-	public:
-		static OBodyReadinessListener* GetSingleton()
-		{
-			static OBodyReadinessListener singleton;
-			return &singleton;
-		}
-
-		void OBodyIsReady() override
-		{
-			g_obodyReady.store(true, std::memory_order_release);
-			spdlog::info("OBody API is ready");
-			ScheduleOBodySyncForLoadedActors(true);
-		}
-
-		void OBodyIsNoLongerReady() override
-		{
-			g_obodyReady.store(false, std::memory_order_release);
-			spdlog::info("OBody API is temporarily unavailable");
-		}
-	};
-
-	void RequestOBodyAPI()
-	{
-		OBody::API::SKSEMessages::RequestPluginInterface request{};
-		request.version = OBody::API::PluginAPIVersion::Latest;
-		request.pluginInterface = &g_obodyAPI;
-		request.readinessEventListener = OBodyReadinessListener::GetSingleton();
-
+		SKEE::InterfaceExchangeMessage message{};
 		SKSE::GetMessagingInterface()->Dispatch(
-			decltype(request)::type, &request, sizeof(request), "OBody");
-		if (g_obodyAPI) {
-			spdlog::info("OBody plugin API found; preset assignment will use INI mappings");
+			SKEE::InterfaceExchangeMessage::kExchangeInterface,
+			&message, sizeof(message), "skee");
+		if (message.interfaceMap) {
+			g_bodyMorphAPI = static_cast<SKEE::IBodyMorphInterface*>(
+				message.interfaceMap->QueryInterface("BodyMorph"));
+		}
+		if (g_bodyMorphAPI) {
+			spdlog::info("RaceMenu/SKEE BodyMorph interface found (version {})",
+				g_bodyMorphAPI->GetVersion());
+			ScheduleBodyMorphsForLoadedActors(true);
 		} else {
-			spdlog::info("OBody plugin API not found; face morphing remains available");
+			spdlog::warn("RaceMenu/SKEE BodyMorph interface not found; body morphing is unavailable");
+		}
+		PublishMenuSnapshot();
+	}
+
+	void ResetRuntimeTracking(bool a_invalidatePending, bool a_clearFaceBuffers = true)
+	{
+		if (a_invalidatePending) {
+			g_loadGeneration.fetch_add(1, std::memory_order_acq_rel);
+			std::lock_guard lock(g_pendingLock);
+			g_pending.clear();
+		}
+		// A save transition does not guarantee that FaceGen rebuilt its FOD buffers.
+		// In practice Skyrim can keep the same, already-morphed allocation alive
+		// across PreLoadGame/PostLoadGame (and even NewGame). Forgetting it here made
+		// the additive face delta run again on the same vertices. Keep the pointer +
+		// fingerprint entries for those transitions: a genuinely rebuilt or recycled
+		// buffer has different contents and will still be applied normally.
+		if (a_clearFaceBuffers) {
+			g_applied.clear();
+		} else {
+			spdlog::info("preserved {} applied face-buffer fingerprint(s) across save transition",
+				g_applied.size());
+		}
+		g_dressed.clear();
+		g_counted.clear();
+		g_announced.clear();
+		g_bodyApplied.clear();
+	}
+
+	bool IsEditableConfigPath(const std::filesystem::path& a_path)
+	{
+		std::error_code ec;
+		const auto root = std::filesystem::absolute(ConfigPath(), ec).lexically_normal();
+		if (ec) {
+			return false;
+		}
+		const auto target = std::filesystem::absolute(a_path, ec).lexically_normal();
+		if (ec) {
+			return false;
+		}
+		auto rootIt = root.begin();
+		auto targetIt = target.begin();
+		for (; rootIt != root.end(); ++rootIt, ++targetIt) {
+			if (targetIt == target.end() || Lowered(rootIt->string()) != Lowered(targetIt->string())) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	std::size_t RefreshLoadedActors(RE::FormID a_onlyBase = 0)
+	{
+		auto* lists = RE::ProcessLists::GetSingleton();
+		if (!lists) {
+			return 0;
+		}
+		std::size_t refreshed = 0;
+		for (auto& handle : lists->highActorHandles) {
+			auto actor = handle.get();
+			if (!actor) {
+				continue;
+			}
+			if (a_onlyBase != 0) {
+				const auto* base = actor->GetActorBase();
+				if (!base || base->GetFormID() != a_onlyBase) {
+					continue;
+				}
+			}
+			ClearOwnedBodyMorph(actor.get(), "menu-refresh");
+			if (auto* base = actor->GetActorBase(); base &&
+				g_originalNpcRecords.contains(base->GetFormID())) {
+				actor->SetDefaultOutfit(base->defaultOutfit, true);
+			}
+			actor->DoReset3D(false);
+			++refreshed;
+		}
+		return refreshed;
+	}
+
+	void ReloadConfigurationFromDisk(bool a_refreshActors, RE::FormID a_onlyBase = 0)
+	{
+		RestoreOriginalRecords();
+		ClearConfigState();
+		LoadPatches();
+		ExpandGroupRules();
+		ResolvePhysiques();
+		ApplyRecordChanges();
+		ResetRuntimeTracking(true);
+		const auto refreshed = a_refreshActors ? RefreshLoadedActors(a_onlyBase) : 0;
+		g_menuStatus = std::format("Reloaded {} effective NPCs from {} INI files; refreshed {} loaded actors",
+			g_entries.size(), g_sources.size(), refreshed);
+		spdlog::info("[menu] {}", g_menuStatus);
+		PublishMenuSnapshot();
+	}
+
+	bool WriteNpcEntry(const mpf::menu::Action& a_action, bool a_remove)
+	{
+		const std::filesystem::path path(a_action.sourcePath);
+		if (!IsEditableConfigPath(path)) {
+			g_menuStatus = "Refused an INI path outside Data/ModernPhysiqueFramework";
+			return false;
+		}
+		std::string error;
+		std::optional<std::string> value;
+		if (!a_remove) {
+			const auto strength = a_action.automaticStrength ? std::string("auto") :
+				std::format("{:g}", std::clamp(a_action.strength, 0.0f, 100.0f));
+			value = std::format("{}, {}", strength, a_action.physique);
+		}
+		if (!mpf::ini::SetValue(path, "NPCs", a_action.targetKey, value, error)) {
+			g_menuStatus = std::format("Could not edit '{}': {}", path.filename().string(), error);
+			return false;
+		}
+		return true;
+	}
+
+	bool WriteFactionEntry(const mpf::menu::Action& a_action, bool a_remove)
+	{
+		const std::filesystem::path path(a_action.sourcePath);
+		if (!IsEditableConfigPath(path)) {
+			g_menuStatus = "Refused an INI path outside Data/ModernPhysiqueFramework";
+			return false;
+		}
+		std::string error;
+		std::optional<std::string> value;
+		if (!a_remove) {
+			const auto strength = a_action.randomStrength ? std::string("random") :
+				a_action.automaticStrength ? std::string("auto") :
+				std::format("{:g}", std::clamp(a_action.strength, 0.0f, 100.0f));
+			const auto physique = a_action.randomPhysique ? std::string("random") : a_action.physique;
+			value = std::format("{}, {}, {}%", strength, physique,
+				std::clamp(a_action.integerValue, 0, 100));
+		}
+		if (!mpf::ini::SetValue(path, "Factions", a_action.targetKey, value, error)) {
+			g_menuStatus = std::format("Could not edit '{}': {}", path.filename().string(), error);
+			return false;
+		}
+		return true;
+	}
+
+	bool EnsureUserIni(const std::filesystem::path& a_path)
+	{
+		if (std::filesystem::exists(a_path)) {
+			return true;
+		}
+		std::string error;
+		if (!mpf::ini::SetValue(a_path, "Settings", "Name", "MPF User", error) ||
+			!mpf::ini::SetValue(a_path, "Settings", "Priority", "0", error)) {
+			g_menuStatus = "Could not create MPF_User.ini: " + error;
+			return false;
+		}
+		return true;
+	}
+
+	void ProcessMenuAction(mpf::menu::Action a_action)
+	{
+		switch (a_action.kind) {
+		case mpf::menu::ActionKind::editNpc:
+			if (WriteNpcEntry(a_action, false)) {
+				ReloadConfigurationFromDisk(true, a_action.formID);
+			} else {
+				PublishMenuSnapshot();
+			}
+			break;
+		case mpf::menu::ActionKind::deleteNpc:
+			if (WriteNpcEntry(a_action, true)) {
+				ReloadConfigurationFromDisk(true, a_action.formID);
+			} else {
+				PublishMenuSnapshot();
+			}
+			break;
+		case mpf::menu::ActionKind::addNpc:
+		{
+			const auto targetID = a_action.formID != 0 ? a_action.formID : ResolveTarget(a_action.stableID);
+			if (targetID == 0 || !RE::TESForm::LookupByID<RE::TESNPC>(targetID)) {
+				g_menuStatus = std::format("NPC '{}' did not resolve", a_action.stableID);
+				PublishMenuSnapshot();
+				break;
+			}
+			if (a_action.formID == 0 && g_entryCandidates.contains(targetID)) {
+				g_menuStatus = "That NPC already has an INI entry; open its row to edit it";
+				PublishMenuSnapshot();
+				break;
+			}
+			const auto userPath = ConfigPath("MPF_User.ini");
+			if (!EnsureUserIni(userPath)) {
+				PublishMenuSnapshot();
+				break;
+			}
+			a_action.sourcePath = userPath.generic_string();
+			a_action.targetKey = a_action.formID != 0 ? StableFormText(
+				RE::TESForm::LookupByID<RE::TESNPC>(targetID)) : a_action.stableID;
+			if (WriteNpcEntry(a_action, false)) {
+				ReloadConfigurationFromDisk(true, targetID);
+			} else {
+				PublishMenuSnapshot();
+			}
+			break;
+		}
+		case mpf::menu::ActionKind::editFaction:
+			if (WriteFactionEntry(a_action, false)) {
+				ReloadConfigurationFromDisk(true);
+			} else {
+				PublishMenuSnapshot();
+			}
+			break;
+		case mpf::menu::ActionKind::deleteFaction:
+			if (WriteFactionEntry(a_action, true)) {
+				ReloadConfigurationFromDisk(true);
+			} else {
+				PublishMenuSnapshot();
+			}
+			break;
+		case mpf::menu::ActionKind::addFaction:
+		{
+			const auto targetID = a_action.formID != 0 ? a_action.formID : ResolveFaction(a_action.stableID);
+			auto* faction = targetID != 0 ? RE::TESForm::LookupByID<RE::TESFaction>(targetID) : nullptr;
+			if (!faction) {
+				g_menuStatus = std::format("Faction '{}' did not resolve", a_action.stableID);
+				PublishMenuSnapshot();
+				break;
+			}
+			if (a_action.formID == 0 && std::ranges::any_of(g_groups, [&](const auto& rule) {
+					return rule.factionID == targetID;
+				})) {
+				g_menuStatus = "That faction already has an INI entry; open it in Factions to edit";
+				PublishMenuSnapshot();
+				break;
+			}
+			const auto userPath = ConfigPath("MPF_User.ini");
+			if (!EnsureUserIni(userPath)) {
+				PublishMenuSnapshot();
+				break;
+			}
+			a_action.sourcePath = userPath.generic_string();
+			a_action.targetKey = StableFormText(faction);
+			if (WriteFactionEntry(a_action, false)) {
+				ReloadConfigurationFromDisk(true);
+			} else {
+				PublishMenuSnapshot();
+			}
+			break;
+		}
+		case mpf::menu::ActionKind::setSourcePriority:
+		{
+			const std::filesystem::path path(a_action.sourcePath);
+			std::string error;
+			if (!IsEditableConfigPath(path) || !mpf::ini::SetValue(path, "Settings", "Priority",
+					std::to_string(a_action.integerValue), error)) {
+				g_menuStatus = error.empty() ? "Refused an INI path outside the MPF config folder" : error;
+				PublishMenuSnapshot();
+			} else {
+				ReloadConfigurationFromDisk(true);
+			}
+			break;
+		}
+		case mpf::menu::ActionKind::setLogging:
+		{
+			const char* levels[] = { "normal", "verbose", "diagnostic" };
+			const int level = std::clamp(a_action.integerValue, 0, 2);
+			std::string error;
+			if (!mpf::ini::SetValue(RuntimeSettingsPath(), "Runtime", "Logging", levels[level], error)) {
+				g_menuStatus = "Could not save runtime settings: " + error;
+			} else {
+				LoadRuntimeSettings();
+				g_menuStatus = std::format("Logging changed to {}", levels[level]);
+			}
+			PublishMenuSnapshot();
+			break;
+		}
+		case mpf::menu::ActionKind::reloadAndRefresh:
+			ReloadConfigurationFromDisk(true);
+			break;
+		case mpf::menu::ActionKind::refreshNearest:
+			if (auto* actor = NearestActor()) {
+				ClearOwnedBodyMorph(actor, "menu-refresh");
+				g_bodyApplied.erase(actor->GetFormID());
+				actor->DoReset3D(false);
+				g_menuStatus = std::format("Refreshed nearest actor '{}'", actor->GetName());
+			} else {
+				g_menuStatus = "No nearby actor was found";
+			}
+			PublishMenuSnapshot();
+			break;
+		case mpf::menu::ActionKind::refreshAll:
+		{
+			ResetRuntimeTracking(true);
+			const auto refreshed = RefreshLoadedActors();
+			g_menuStatus = std::format("Refreshed {} loaded actors", refreshed);
+			PublishMenuSnapshot();
+			break;
+		}
+		}
+	}
+
+	void ReceiveMenuAction(mpf::menu::Action a_action)
+	{
+		if (auto* tasks = SKSE::GetTaskInterface()) {
+			tasks->AddTask([action = std::move(a_action)]() mutable {
+				ProcessMenuAction(std::move(action));
+			});
 		}
 	}
 
@@ -1893,11 +3049,16 @@ namespace
 	{
 		switch (a_msg->type) {
 		case SKSE::MessagingInterface::kPostPostLoad:
-			RequestOBodyAPI();
+			if (mpf::menu::Register()) {
+				spdlog::info("SKSE Menu Framework page registered (version {})",
+					mpf::menu::FrameworkApiVersion());
+			}
+			RequestBodyMorphAPI();
 			break;
 		case SKSE::MessagingInterface::kDataLoaded:
 			BuildHeadPartIndex();
 			LoadLibrary();
+			LoadRuntimeSettings();
 			LoadPatches();
 			LoadOutfitTable();
 			LoadFactionNames();
@@ -1905,30 +3066,37 @@ namespace
 			ResolvePhysiques();
 			ApplyRecordChanges();
 			g_dataLoaded.store(true, std::memory_order_release);
-			if (HasOBodyPresetMappings() && !g_obodyAPI) {
-				spdlog::warn("OBody preset mappings are configured, but a compatible OBody API was not found");
+			if (HasBodyMorphMappings() && !g_bodyMorphAPI) {
+				spdlog::warn("body morph mappings are configured, but RaceMenu/SKEE is unavailable");
 			}
-			ScheduleOBodySyncForLoadedActors(false);
-			if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
-				holder->AddEventSink<RE::TESObjectLoadedEvent>(LoadSink::GetSingleton());
-			}
+			ScheduleBodyMorphsForLoadedActors(false);
 			if (auto* input = RE::BSInputDeviceManager::GetSingleton()) {
 				input->AddEventSink<RE::InputEvent*>(InputSink::GetSingleton());
 			}
 			InstallHook();
-			spdlog::info("ready: applies when a head is built | F6 apply to nearest | F7 report nearest");
+			spdlog::info("ready: applies when a head is built | F6 apply to nearest | Shift+F7 report nearest");
+			g_menuStatus = std::format("Loaded {} effective NPCs from {} INI files",
+				g_entries.size(), g_sources.size());
+			PublishMenuSnapshot();
+			break;
+		case SKSE::MessagingInterface::kPreLoadGame:
+			// A delayed task from the previous save must never resolve a recycled
+			// handle in the next one. Invalidate it before the loading screen starts,
+			// but retain face-buffer fingerprints because FaceGen may reuse those
+			// already-morphed buffers during the load.
+			ResetRuntimeTracking(true, false);
 			break;
 		case SKSE::MessagingInterface::kPostLoadGame:
+			// Load3D calls queued during the load belong to the new generation and
+			// are intentionally retained so their faces can be applied.
+			ScheduleBodyMorphsForLoadedActors(false);
+			break;
 		case SKSE::MessagingInterface::kNewGame:
-			// Heads are rebuilt across a load, so the record of what we already
-			// wrote is stale.
-			g_applied.clear();
-			g_dressed.clear();
-			g_counted.clear();
-			g_announced.clear();
-			g_obodySynced.clear();
-			g_obodyFailed.clear();
-			ScheduleOBodySyncForLoadedActors(false);
+			// NewGame can also reuse FaceGen allocations from the previous world when
+			// entered without restarting the process.
+			ResetRuntimeTracking(true, false);
+			ScheduleBodyMorphsForLoadedActors(false);
+			QueueLoadedActorsForHeads();
 			break;
 		default:
 			break;
@@ -1940,7 +3108,10 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
 	SetupLog();
-	spdlog::info("Modern Physique Framework (MPF) loaded");
+	spdlog::info("Modern Physique Framework (MPF) {} loaded | backend={} | build={} | compiled={} {}",
+		MPF_VERSION, MPF_BODY_BACKEND, MPF_BUILD_ID, __DATE__, __TIME__);
+	mpf::menu::SetActionHandler(ReceiveMenuAction);
+	mpf::menu::Register();
 	SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
 	return true;
 }

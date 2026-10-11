@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "tri.h"
 
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <format>
+#include <limits>
 
 namespace rfm
 {
@@ -19,9 +21,9 @@ namespace rfm
 			Cursor(const std::vector<std::uint8_t>& a_data) :
 				_d(a_data) {}
 
-			[[nodiscard]] bool Take(std::size_t a_n, const std::uint8_t*& a_out)
+		[[nodiscard]] bool Take(std::size_t a_n, const std::uint8_t*& a_out)
 			{
-				if (_pos + a_n > _d.size()) {
+				if (_pos > _d.size() || a_n > _d.size() - _pos) {
 					return false;
 				}
 				a_out = _d.data() + _pos;
@@ -66,12 +68,29 @@ namespace rfm
 
 	bool TriFile::Load(const std::filesystem::path& a_path, std::string& a_error)
 	{
+		_vertexCount = 0;
+		_verts.clear();
+		_morphs.clear();
+		a_error.clear();
+
 		std::ifstream file(a_path, std::ios::binary | std::ios::ate);
 		if (!file) {
 			a_error = "cannot open file";
 			return false;
 		}
-		const auto size = static_cast<std::size_t>(file.tellg());
+		const auto end = file.tellg();
+		if (end < 0) {
+			a_error = "cannot determine file size";
+			return false;
+		}
+		constexpr std::size_t kMaxTriBytes = 512u * 1024u * 1024u;
+		const auto size64 = static_cast<std::uintmax_t>(end);
+		if (size64 > kMaxTriBytes ||
+			size64 > static_cast<std::uintmax_t>((std::numeric_limits<std::streamsize>::max)())) {
+			a_error = "file is unreasonably large";
+			return false;
+		}
+		const auto size = static_cast<std::size_t>(size64);
 		file.seekg(0);
 		std::vector<std::uint8_t> data(size);
 		if (!file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size))) {
@@ -115,6 +134,10 @@ namespace rfm
 		for (std::uint32_t v = 0; v < vertexCount; ++v) {
 			float xyz[3];
 			std::memcpy(xyz, baseVertBytes + static_cast<std::size_t>(v) * 12, 12);
+			if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) {
+				a_error = std::format("non-finite base vertex {}", v);
+				return false;
+			}
 			_verts[v] = Vec3{ xyz[0], xyz[1], xyz[2] };
 		}
 
@@ -151,6 +174,10 @@ namespace rfm
 				a_error = std::format("truncated at morph '{}' multiplier", name);
 				return false;
 			}
+			if (!std::isfinite(multiplier)) {
+				a_error = std::format("non-finite multiplier in morph '{}'", name);
+				return false;
+			}
 
 			const std::uint8_t* raw = nullptr;
 			if (!cur.Take(static_cast<std::size_t>(vertexCount) * 6, raw)) {
@@ -162,13 +189,25 @@ namespace rfm
 			for (std::uint32_t v = 0; v < vertexCount; ++v) {
 				std::int16_t xyz[3]{};
 				std::memcpy(xyz, raw + static_cast<std::size_t>(v) * 6, 6);
-				deltas[v] = Vec3{
+				const Vec3 delta{
 					static_cast<float>(xyz[0]) * multiplier,
 					static_cast<float>(xyz[1]) * multiplier,
 					static_cast<float>(xyz[2]) * multiplier
 				};
+				if (!std::isfinite(delta.x) || !std::isfinite(delta.y) || !std::isfinite(delta.z)) {
+					a_error = std::format("non-finite delta in morph '{}' at vertex {}", name, v);
+					return false;
+				}
+				deltas[v] = delta;
 			}
-			_morphs.emplace(std::move(name), std::move(deltas));
+			if (name.empty()) {
+				a_error = std::format("morph {} has an empty name", m);
+				return false;
+			}
+			if (!_morphs.emplace(name, std::move(deltas)).second) {
+				a_error = std::format("duplicate morph name '{}'", name);
+				return false;
+			}
 		}
 
 		_vertexCount = vertexCount;

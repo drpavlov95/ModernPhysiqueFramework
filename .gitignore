@@ -16,3 +16,10 @@ MOD_PAGE.txt
 *.bak_*
 *.user
 docs/MPF_Nexus_Description.md
+
+# Local reverse-engineering and tool output
+*.obj
+*.bin
+*_dump.txt
+tools/*.exe
+tools/__pycache__/

@@ -3,6 +3,31 @@ cmake_minimum_required(VERSION 3.21)
 
 project(MPF VERSION 0.1.0 LANGUAGES CXX)
 
+# The startup log carries an exact source fingerprint. This catches stale or
+# conflicting MPF.dll copies without depending on Git being installed on the
+# machine doing the build. Reconfigure whenever an identity input changes.
+set(MPF_BUILD_ID_FILES
+    src/plugin.cpp
+    src/tri.cpp
+    src/tri.h
+    src/bodytri.cpp
+    src/bodytri.h
+    src/ini_edit.cpp
+    src/ini_edit.h
+    src/menu.cpp
+    src/menu.h
+    src/third_party/skee/SKEE.h
+    src/third_party/skse_menu_framework/API.h
+)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MPF_BUILD_ID_FILES})
+set(MPF_BUILD_ID_INPUT "MPF-${PROJECT_VERSION}-direct-skee")
+foreach(MPF_BUILD_ID_FILE IN LISTS MPF_BUILD_ID_FILES)
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${MPF_BUILD_ID_FILE}" MPF_FILE_HASH)
+    string(APPEND MPF_BUILD_ID_INPUT "-${MPF_FILE_HASH}")
+endforeach()
+string(SHA256 MPF_BUILD_ID_FULL "${MPF_BUILD_ID_INPUT}")
+string(SUBSTRING "${MPF_BUILD_ID_FULL}" 0 12 MPF_BUILD_ID)
+
 # Deployment is opt-in and needs an explicit destination: a stale cache entry
 # alone must never be enough to copy a DLL into the game.
 option(RFM_ENABLE_POST_BUILD_DEPLOY "Allow CMake to copy the plugin after building" OFF)
@@ -18,13 +43,28 @@ add_commonlibsse_plugin(${PROJECT_NAME}
         src/plugin.cpp
         src/tri.cpp
         src/tri.h
-        src/third_party/obody/API.h
+        src/bodytri.cpp
+        src/bodytri.h
+        src/ini_edit.cpp
+        src/ini_edit.h
+        src/menu.cpp
+        src/menu.h
+        src/third_party/skee/SKEE.h
+        src/third_party/skse_menu_framework/API.h
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
 target_link_libraries(${PROJECT_NAME} PRIVATE tomlplusplus::tomlplusplus)
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    MPF_VERSION="${PROJECT_VERSION}"
+    MPF_BUILD_ID="${MPF_BUILD_ID}"
+    MPF_BODY_BACKEND="direct-RaceMenu/SKEE"
+)
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4)
+endif()
 
 # SimpleIni is header-only: the user-facing NPC list is an INI, while the
 # author-facing morph manifest stays TOML.
